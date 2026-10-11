@@ -597,6 +597,13 @@ func (r *TaskReconciler) handleDeletion(ctx context.Context, task *corev1alpha1.
 			if !prepared {
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
+			attemptSettled, err := r.settleRetiredBeforeDispatchACPTask(ctx, task)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !attemptSettled {
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
 			ready, err := r.acpTaskDeletionReady(ctx, task)
 			if err != nil {
 				return ctrl.Result{}, err

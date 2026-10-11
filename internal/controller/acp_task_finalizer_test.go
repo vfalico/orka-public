@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
@@ -296,6 +297,281 @@ func TestACPQueuedTimeoutPreservesTerminalProjectionBarrier(t *testing.T) {
 	}
 }
 
+func TestDeletingACPTaskRetiredBeforeDurableAttemptUsesNoAttemptReclamation(t *testing.T) {
+	task, attempt := promptAttemptReclaimFinalizerFixture(t)
+	task.Finalizers = []string{labels.TaskFinalizer}
+	task.Spec.Workspace = &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead}
+	task.Status.Phase = corev1alpha1.TaskPhasePending
+	task.Status.Execution.State = corev1alpha1.TaskExecutionStatePlanned
+	task.Status.Execution.Outcome = ""
+	task.Status.Execution.Reason = ""
+	task.Status.Execution.RuntimePoolName = "pool"
+	task.Status.Execution.RuntimePoolUID = "pool-uid"
+	task.Status.Execution.RuntimeInstanceID = "runtime-instance"
+	task.Status.Execution.RuntimeSessionUID = "runtime-session"
+	task.Status.Execution.RuntimeSessionGeneration = 2
+	task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{
+		State: corev1alpha1.TaskDeliveryStateNotRequested, Outcome: corev1alpha1.TaskDeliveryOutcomeNotRequested,
+	}
+	cleanupDigest, err := taskScopedRuntimeSessionCleanupDigest(
+		task.UID, task.Status.Execution.Attempt, task.Status.Execution.RuntimeInstanceID,
+		task.Status.Execution.RuntimeSessionUID, task.Status.Execution.RuntimeSessionGeneration,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Execution.RuntimeSessionCleanupDigest = cleanupDigest
+	controlStore := &promptAttemptReclaimControlStore{}
+	reconciler := newUnitReconciler(newTestScheme(), task)
+	reconciler.DurableControlStore = controlStore
+	reconciler.ControllerEpochManager = readyPromptAttemptReclaimEpochManager()
+
+	ready, err := reconciler.acpTaskDeletionReady(context.Background(), task)
+	if err != nil || !ready {
+		t.Fatalf("retired pre-attempt Task deletion readiness = %v, %v", ready, err)
+	}
+	request, err := reconciler.acpPromptAttemptReclamationRequest(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Mode != store.PromptAttemptReclamationNoAttempt || request.FinalPromptAttemptID != "" || request.TerminalProjectionID != "" {
+		t.Fatalf("request = %#v, want no-attempt reclamation", request)
+	}
+
+	controlStore.attempt = attempt
+	attempt.ExecutionState = store.PromptExecutionPlanned
+	if ready, err := reconciler.acpTaskDeletionReady(context.Background(), task); err != nil || ready {
+		t.Fatalf("Task with a nonterminal durable attempt became deletion-ready: %v, %v", ready, err)
+	}
+	task.Status.Execution.RuntimeSessionCleanupDigest = ""
+	controlStore.attempt = nil
+	if ready, err := reconciler.acpTaskDeletionReady(context.Background(), task); err != nil || ready {
+		t.Fatalf("Task without exact runtime retirement proof became deletion-ready: %v, %v", ready, err)
+	}
+}
+
+func TestDeletingACPTaskSettlesBoundPlannedAttemptBeforeReclamation(t *testing.T) {
+	task, attempt := retiredBeforeDispatchFixture(t)
+	controlStore := &promptAttemptReclaimControlStore{attempt: attempt}
+	reconciler := newUnitReconciler(newTestScheme(), task)
+	reconciler.APIReader = reconciler.Client
+	reconciler.DurableControlStore = controlStore
+	reconciler.ControllerEpochManager = readyPromptAttemptReclaimEpochManager()
+
+	settled, err := reconciler.settleRetiredBeforeDispatchACPTask(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settled {
+		t.Fatal("retired-before-dispatch settlement reported ready before terminal projection delivery")
+	}
+	if controlStore.attempt.ExecutionState != store.PromptExecutionCancelled ||
+		controlStore.attempt.DeliveryState != store.PromptDeliveryNotRequested ||
+		controlStore.attempt.TerminalReason != string(acpRetiredBeforeDispatchReason) ||
+		controlStore.attempt.OutcomeMarker != acpRetiredBeforeDispatchMessage {
+		t.Fatalf("settled attempt = %#v", controlStore.attempt)
+	}
+	if controlStore.projection == nil ||
+		controlStore.projection.ID != standaloneTaskTerminalProjectionID(task, task.Status.Execution.Attempt) ||
+		controlStore.projection.State != store.OutboxProjectionPending {
+		t.Fatalf("terminal projection = %#v", controlStore.projection)
+	}
+	stored := &corev1alpha1.Task{}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(task), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != corev1alpha1.TaskPhaseCancelled || stored.Status.Execution == nil ||
+		stored.Status.Execution.State != corev1alpha1.TaskExecutionStateCancelled ||
+		stored.Status.Execution.Outcome != corev1alpha1.TaskExecutionOutcomeCancelled ||
+		stored.Status.Execution.Reason != acpRetiredBeforeDispatchReason ||
+		stored.Status.Execution.RuntimeInstanceID != task.Status.Execution.RuntimeInstanceID ||
+		stored.Status.Execution.RuntimeSessionUID != task.Status.Execution.RuntimeSessionUID {
+		t.Fatalf("terminal Task status = %#v", stored.Status)
+	}
+
+	// A crash after the attempt transition but before observing the projected
+	// Task retries the same immutable operation and projection.
+	if settled, err := reconciler.settleRetiredBeforeDispatchACPTask(context.Background(), task); err != nil || settled {
+		t.Fatalf("idempotent settlement retry = %v, %v", settled, err)
+	}
+}
+
+func TestDeletingACPTaskRetiredBeforeDispatchRejectsContradictoryEvidence(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*corev1alpha1.Task, *store.PromptAttempt, *promptAttemptReclaimControlStore) client.Object
+	}{
+		{
+			name: "attempt identity drift",
+			mutate: func(_ *corev1alpha1.Task, attempt *store.PromptAttempt, _ *promptAttemptReclaimControlStore) client.Object {
+				attempt.RequestDigest = testControlDigestForDispatcher("different-request")
+				return nil
+			},
+		},
+		{
+			name: "publication exists",
+			mutate: func(task *corev1alpha1.Task, _ *store.PromptAttempt, control *promptAttemptReclaimControlStore) client.Object {
+				control.publication = &store.Publication{ID: publicationIDForTask(task)}
+				return nil
+			},
+		},
+		{
+			name: "external effect exists",
+			mutate: func(task *corev1alpha1.Task, _ *store.PromptAttempt, _ *promptAttemptReclaimControlStore) client.Object {
+				return &corev1alpha1.ExternalEffect{
+					ObjectMeta: metav1.ObjectMeta{Namespace: task.Namespace, Name: "effect"},
+					Spec: corev1alpha1.ExternalEffectSpec{
+						AggregateID: string(task.UID),
+					},
+				}
+			},
+		},
+		{
+			name: "session turn exists",
+			mutate: func(_ *corev1alpha1.Task, attempt *store.PromptAttempt, control *promptAttemptReclaimControlStore) client.Object {
+				control.turn = &store.SessionTurn{
+					ID: "turn", Key: store.SessionTurnKey{
+						SessionUID: attempt.SessionUID, LeaseGeneration: attempt.SessionLeaseGeneration,
+						TaskUID: attempt.Key.TaskUID, Attempt: attempt.Key.Attempt, PromptID: attempt.Key.PromptID,
+					},
+				}
+				return nil
+			},
+		},
+		{
+			name: "runtime session control exists",
+			mutate: func(task *corev1alpha1.Task, _ *store.PromptAttempt, _ *promptAttemptReclaimControlStore) client.Object {
+				return &corev1alpha1.RuntimeSessionControl{
+					ObjectMeta: metav1.ObjectMeta{Namespace: task.Namespace, Name: "session-control"},
+					Spec: corev1alpha1.RuntimeSessionControlSpec{
+						SessionName: "session", SessionUID: "session-uid",
+						RequestDigest: testControlDigestForDispatcher("session-control"),
+						Owner:         corev1alpha1.ControlRecordOwner{Kind: "Task", UID: string(task.UID)},
+					},
+				}
+			},
+		},
+		{
+			name: "runtime session control matches frozen session",
+			mutate: func(task *corev1alpha1.Task, _ *store.PromptAttempt, _ *promptAttemptReclaimControlStore) client.Object {
+				return &corev1alpha1.RuntimeSessionControl{
+					ObjectMeta: metav1.ObjectMeta{Namespace: task.Namespace, Name: "frozen-session-control"},
+					Spec: corev1alpha1.RuntimeSessionControlSpec{
+						SessionName: "session", SessionUID: task.Status.Execution.RuntimeSessionUID,
+						RequestDigest: testControlDigestForDispatcher("frozen-session-control"),
+						Owner:         corev1alpha1.ControlRecordOwner{Kind: "Session", UID: "other-owner"},
+					},
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			task, attempt := retiredBeforeDispatchFixture(t)
+			controlStore := &promptAttemptReclaimControlStore{attempt: attempt}
+			extra := test.mutate(task, attempt, controlStore)
+			objects := []client.Object{task}
+			if extra != nil {
+				objects = append(objects, extra)
+			}
+			reconciler := newUnitReconciler(newTestScheme(), objects...)
+			reconciler.APIReader = reconciler.Client
+			reconciler.DurableControlStore = controlStore
+			reconciler.ControllerEpochManager = readyPromptAttemptReclaimEpochManager()
+
+			if settled, err := reconciler.settleRetiredBeforeDispatchACPTask(context.Background(), task); err == nil || settled {
+				t.Fatalf("contradictory settlement = %v, %v, want false/error", settled, err)
+			}
+			if controlStore.transitionCalls != 0 || controlStore.projection != nil {
+				t.Fatalf("contradictory evidence mutated attempt/projection: transitions=%d projection=%#v",
+					controlStore.transitionCalls, controlStore.projection)
+			}
+		})
+	}
+}
+
+func TestDeletingACPTaskRetiredBeforeDispatchUsesAuthoritativeContradictionReader(t *testing.T) {
+	task, attempt := retiredBeforeDispatchFixture(t)
+	controlStore := &promptAttemptReclaimControlStore{attempt: attempt}
+	reconciler := newUnitReconciler(newTestScheme(), task)
+	reconciler.APIReader = newUnitReconciler(
+		newTestScheme(),
+		task.DeepCopy(),
+		&corev1alpha1.ExternalEffect{
+			ObjectMeta: metav1.ObjectMeta{Namespace: task.Namespace, Name: "authoritative-effect"},
+			Spec:       corev1alpha1.ExternalEffectSpec{AggregateID: string(task.UID)},
+		},
+	).Client
+	reconciler.DurableControlStore = controlStore
+	reconciler.ControllerEpochManager = readyPromptAttemptReclaimEpochManager()
+
+	if settled, err := reconciler.settleRetiredBeforeDispatchACPTask(context.Background(), task); err == nil || settled {
+		t.Fatalf("authoritative contradiction settlement = %v, %v, want false/error", settled, err)
+	}
+	if controlStore.transitionCalls != 0 || controlStore.projection != nil {
+		t.Fatalf("authoritative contradiction mutated attempt/projection: transitions=%d projection=%#v",
+			controlStore.transitionCalls, controlStore.projection)
+	}
+}
+
+func TestDeletingACPTaskRetiredBeforeDispatchCASPreservesValidatedDeliveryState(t *testing.T) {
+	task, attempt := retiredBeforeDispatchFixture(t)
+	controlStore := &promptAttemptReclaimControlStore{attempt: attempt, raceBeforeTransition: true}
+	reconciler := newUnitReconciler(newTestScheme(), task)
+	reconciler.APIReader = reconciler.Client
+	reconciler.DurableControlStore = controlStore
+	reconciler.ControllerEpochManager = readyPromptAttemptReclaimEpochManager()
+
+	if settled, err := reconciler.settleRetiredBeforeDispatchACPTask(context.Background(), task); err == nil || settled {
+		t.Fatalf("raced settlement = %v, %v, want false/error", settled, err)
+	}
+	if controlStore.attempt.ExecutionState != store.PromptExecutionPlanned ||
+		controlStore.attempt.DeliveryState != store.PromptDeliveryValidating ||
+		controlStore.projection != nil {
+		t.Fatalf("raced attempt/projection = %#v / %#v", controlStore.attempt, controlStore.projection)
+	}
+}
+
+func retiredBeforeDispatchFixture(t *testing.T) (*corev1alpha1.Task, *store.PromptAttempt) {
+	t.Helper()
+	task, attempt := promptAttemptReclaimFinalizerFixture(t)
+	task.Finalizers = []string{labels.TaskFinalizer}
+	task.Spec.Workspace = &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead}
+	task.Status.AgentExecutionBinding = testACPExecuteBindingForDispatcher()
+	task.Status.AgentExecutionBinding.Task.UID = task.UID
+	task.Status.Phase = corev1alpha1.TaskPhasePending
+	task.Status.Execution.State = corev1alpha1.TaskExecutionStatePlanned
+	task.Status.Execution.Outcome = ""
+	task.Status.Execution.Reason = ""
+	task.Status.Execution.RequestDigest = testControlDigestForDispatcher("retired-before-dispatch-request")
+	task.Status.Execution.RuntimePoolName = "pool"
+	task.Status.Execution.RuntimePoolUID = "pool-uid"
+	task.Status.Execution.RuntimeInstanceID = "runtime-instance"
+	task.Status.Execution.RuntimeSessionUID = "runtime-session"
+	task.Status.Execution.RuntimeSessionGeneration = 2
+	task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{
+		State: corev1alpha1.TaskDeliveryStateNotRequested, Outcome: corev1alpha1.TaskDeliveryOutcomeNotRequested,
+	}
+	cleanupDigest, err := taskScopedRuntimeSessionCleanupDigest(
+		task.UID, task.Status.Execution.Attempt, task.Status.Execution.RuntimeInstanceID,
+		task.Status.Execution.RuntimeSessionUID, task.Status.Execution.RuntimeSessionGeneration,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Execution.RuntimeSessionCleanupDigest = cleanupDigest
+	attempt.ExecutionState = store.PromptExecutionPlanned
+	attempt.DeliveryState = store.PromptDeliveryNotRequested
+	attempt.RequestDigest = task.Status.Execution.RequestDigest
+	attempt.BindingDigest = task.Status.AgentExecutionBinding.BindingDigest
+	attempt.SnapshotDigest = task.Status.AgentExecutionBinding.Snapshot.Digest
+	attempt.RuntimeInstanceID = task.Status.Execution.RuntimeInstanceID
+	attempt.SessionUID = task.Status.Execution.RuntimeSessionUID
+	attempt.SessionLeaseGeneration = task.Status.Execution.RuntimeSessionGeneration
+	attempt.Version = 4
+	return task, attempt
+}
+
 func TestDeletingACPTaskReclaimsPublisherCacheBeforeDurableArtifactsAndRetries(t *testing.T) {
 	task, attempt := promptAttemptReclaimFinalizerFixture(t)
 	task.Finalizers = []string{labels.TaskFinalizer}
@@ -420,14 +696,17 @@ func promptAttemptReclaimFinalizerFixture(t *testing.T) (*corev1alpha1.Task, *st
 
 type promptAttemptReclaimControlStore struct {
 	store.DurableControlStore
-	attempt         *store.PromptAttempt
-	getAttemptIDs   []string
-	reclaimed       int
-	reclaimErr      error
-	reclaimRequests []store.ReclaimPromptAttemptsRequest
-	projection      *store.OutboxProjection
-	publication     *store.Publication
-	events          *[]string
+	attempt              *store.PromptAttempt
+	getAttemptIDs        []string
+	reclaimed            int
+	reclaimErr           error
+	reclaimRequests      []store.ReclaimPromptAttemptsRequest
+	projection           *store.OutboxProjection
+	publication          *store.Publication
+	turn                 *store.SessionTurn
+	transitionCalls      int
+	raceBeforeTransition bool
+	events               *[]string
 }
 
 func (s *promptAttemptReclaimControlStore) GetOutboxProjection(_ context.Context, id string) (*store.OutboxProjection, error) {
@@ -436,6 +715,25 @@ func (s *promptAttemptReclaimControlStore) GetOutboxProjection(_ context.Context
 	}
 	copy := *s.projection
 	return &copy, nil
+}
+
+func (s *promptAttemptReclaimControlStore) EnqueueOutboxProjection(
+	_ context.Context,
+	projection *store.OutboxProjection,
+	_ store.ControllerEpochFence,
+) (*store.OutboxProjection, error) {
+	if s.projection != nil {
+		if s.projection.ID != projection.ID || s.projection.PayloadDigest != projection.PayloadDigest {
+			return nil, store.ErrConflict
+		}
+		copy := *s.projection
+		return &copy, nil
+	}
+	copy := *projection
+	copy.State = store.OutboxProjectionPending
+	copy.Version = 1
+	s.projection = &copy
+	return projection, nil
 }
 
 func (s *promptAttemptReclaimControlStore) PreparePromptAttemptReclamation(context.Context, store.ReclaimPromptAttemptsRequest) error {
@@ -451,6 +749,44 @@ func (s *promptAttemptReclaimControlStore) GetPromptAttempt(_ context.Context, i
 		return nil, store.ErrNotFound
 	}
 	copy := *s.attempt
+	return &copy, nil
+}
+
+func (s *promptAttemptReclaimControlStore) TransitionPromptAttemptExecution(
+	_ context.Context,
+	transition store.PromptAttemptExecutionTransition,
+) (*store.PromptAttempt, error) {
+	if s.raceBeforeTransition {
+		s.raceBeforeTransition = false
+		s.attempt.DeliveryState = store.PromptDeliveryValidating
+		s.attempt.Version++
+	}
+	if s.attempt == nil || s.attempt.ID != transition.ID ||
+		s.attempt.Version != transition.ExpectedVersion || s.attempt.ExecutionState != transition.ExpectedState {
+		return nil, store.ErrConflict
+	}
+	s.transitionCalls++
+	s.attempt.ExecutionState = transition.NewState
+	s.attempt.TerminalReason = transition.TerminalReason
+	s.attempt.OutcomeMarker = transition.OutcomeMarker
+	s.attempt.LastOperationID = transition.OperationID
+	s.attempt.LastOperationDigest = transition.OperationDigest
+	s.attempt.Version++
+	s.attempt.ControllerEpoch = transition.Fence.Epoch
+	s.attempt.UpdatedAt = transition.UpdatedAt
+	copy := *s.attempt
+	return &copy, nil
+}
+
+func (s *promptAttemptReclaimControlStore) GetSessionTurn(_ context.Context, id string) (*store.SessionTurn, error) {
+	if s.turn == nil {
+		return nil, store.ErrNotFound
+	}
+	expected, err := s.turn.Key.CanonicalID()
+	if err != nil || expected != id {
+		return nil, store.ErrNotFound
+	}
+	copy := *s.turn
 	return &copy, nil
 }
 

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,6 +21,11 @@ import (
 )
 
 const conditionTypeACPArtifactsRetired = "ACPArtifactsRetired"
+
+const (
+	acpRetiredBeforeDispatchReason  = corev1alpha1.TaskExecutionReason("DeletedBeforeDispatch")
+	acpRetiredBeforeDispatchMessage = "task was deleted after runtime retirement and before prompt dispatch"
+)
 
 // ACPPublicationReclaimer removes Publisher-local cache state after every
 // durable publication/session barrier for a deleting Task has settled.
@@ -92,6 +99,11 @@ func (r *TaskReconciler) acpTaskCleanupReady(ctx context.Context, task *corev1al
 	attempt, err := r.DurableControlStore.GetPromptAttempt(ctx, attemptID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			if acpTaskRetiredBeforeDurableAttempt(task) {
+				publicationID := publicationIDForTaskUID(task, acpTaskControlUID(task))
+				unsettled, effectErr := r.acpTaskHasUnsettledExternalEffects(ctx, task, publicationID)
+				return !unsettled, effectErr
+			}
 			// The final attempt may already have been removed by a prepared
 			// reclamation. Let the store validate its durable marker on retry.
 			return r.acpTaskSessionDeletionReady(ctx, task, nil)
@@ -198,6 +210,198 @@ func acpTaskTerminalBeforeDurableAttempt(task *corev1alpha1.Task) bool {
 		return false
 	}
 	return delivery.State == corev1alpha1.TaskDeliveryStateNotRequested && delivery.Outcome == corev1alpha1.TaskDeliveryOutcomeNotRequested
+}
+
+func acpTaskRetiredBeforeDurableAttempt(task *corev1alpha1.Task) bool {
+	if task == nil || task.DeletionTimestamp.IsZero() || task.Spec.SessionRef != nil ||
+		task.Status.Execution == nil || task.Status.Delivery == nil {
+		return false
+	}
+	if task.Spec.Workspace != nil && task.Spec.Workspace.Intent == corev1alpha1.WorkspaceIntentWrite {
+		return false
+	}
+	execution := task.Status.Execution
+	delivery := task.Status.Delivery
+	return task.Status.Phase == corev1alpha1.TaskPhasePending &&
+		execution.State == corev1alpha1.TaskExecutionStatePlanned &&
+		execution.Outcome == "" && execution.Reason == "" &&
+		execution.Attempt > 0 && execution.PromptID != "" &&
+		execution.RuntimePoolName != "" && execution.RuntimePoolUID != "" &&
+		execution.RuntimeInstanceID != "" && execution.RuntimeSessionUID != "" &&
+		execution.RuntimeSessionGeneration > 0 &&
+		delivery.State == corev1alpha1.TaskDeliveryStateNotRequested &&
+		delivery.Outcome == corev1alpha1.TaskDeliveryOutcomeNotRequested &&
+		runtimeSessionCleanupCompleteForUID(task, acpTaskControlUID(task))
+}
+
+func (r *TaskReconciler) settleRetiredBeforeDispatchACPTask(ctx context.Context, task *corev1alpha1.Task) (bool, error) {
+	if !acpTaskRetiredBeforeDurableAttempt(task) {
+		return true, nil
+	}
+	attemptID, err := promptAttemptIDFromTaskUID(task, acpTaskControlUID(task))
+	if err != nil {
+		return false, err
+	}
+	attempt, err := r.DurableControlStore.GetPromptAttempt(ctx, attemptID)
+	if errors.Is(err, store.ErrNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := validateRetiredBeforeDispatchAttempt(task, attempt, attemptID); err != nil {
+		return false, err
+	}
+	publicationID := publicationIDForTaskUID(task, acpTaskControlUID(task))
+	if _, err := r.DurableControlStore.GetPublication(ctx, publicationID); err == nil {
+		return false, fmt.Errorf("%w: retired-before-dispatch Task owns a Publication", store.ErrConflict)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return false, err
+	}
+	if found, err := r.acpTaskHasAnyExternalEffects(ctx, task, publicationID); err != nil {
+		return false, err
+	} else if found {
+		return false, fmt.Errorf("%w: retired-before-dispatch Task owns an external effect", store.ErrConflict)
+	}
+	turnKey := store.SessionTurnKey{
+		SessionUID: attempt.SessionUID, LeaseGeneration: attempt.SessionLeaseGeneration,
+		TaskUID: attempt.Key.TaskUID, Attempt: attempt.Key.Attempt, PromptID: attempt.Key.PromptID,
+	}
+	turnID, err := turnKey.CanonicalID()
+	if err != nil {
+		return false, err
+	}
+	if _, err := r.DurableControlStore.GetSessionTurn(ctx, turnID); err == nil {
+		return false, fmt.Errorf("%w: retired-before-dispatch Task owns a SessionTurn", store.ErrConflict)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return false, err
+	}
+	if found, err := r.acpTaskHasRuntimeSessionControl(ctx, task, attemptID); err != nil {
+		return false, err
+	} else if found {
+		return false, fmt.Errorf("%w: retired-before-dispatch Task retains RuntimeSessionControl state", store.ErrConflict)
+	}
+	fence, err := r.ControllerEpochManager.CurrentFence(ctx)
+	if err != nil {
+		return false, err
+	}
+	if attempt.ExecutionState == store.PromptExecutionPlanned {
+		operation := "retire-before-dispatch"
+		digest, err := acpDomainDigest("attempt-transition", map[string]any{
+			"id": attempt.ID, transitionFromField: attempt.ExecutionState, "to": store.PromptExecutionCancelled,
+			operationField: operation, versionField: attempt.Version,
+			terminalReasonField: acpRetiredBeforeDispatchReason, "outcomeMarker": acpRetiredBeforeDispatchMessage,
+		})
+		if err != nil {
+			return false, err
+		}
+		if _, err := r.DurableControlStore.TransitionPromptAttemptExecution(ctx, store.PromptAttemptExecutionTransition{
+			ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: store.PromptExecutionPlanned,
+			NewState: store.PromptExecutionCancelled, OperationID: operation + "-" + strconv.FormatInt(attempt.Version, 10),
+			OperationDigest: digest, TerminalReason: string(acpRetiredBeforeDispatchReason),
+			OutcomeMarker: acpRetiredBeforeDispatchMessage, UpdatedAt: time.Now().UTC(),
+		}); err != nil {
+			return false, err
+		}
+	}
+	dispatcher := &ACPDispatcher{
+		Client: r.Client, APIReader: r.APIReader, Store: r.DurableControlStore, Epochs: r.ControllerEpochManager,
+	}
+	if err := dispatcher.failTask(
+		ctx,
+		task,
+		corev1alpha1.TaskExecutionStateCancelled,
+		corev1alpha1.TaskExecutionOutcomeCancelled,
+		acpRetiredBeforeDispatchReason,
+		acpRetiredBeforeDispatchMessage,
+	); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func validateRetiredBeforeDispatchAttempt(task *corev1alpha1.Task, attempt *store.PromptAttempt, attemptID string) error {
+	if task == nil || task.Status.Execution == nil || task.Status.AgentExecutionBinding == nil || attempt == nil {
+		return fmt.Errorf("%w: retired-before-dispatch execution evidence is incomplete", store.ErrConflict)
+	}
+	execution := task.Status.Execution
+	binding := task.Status.AgentExecutionBinding
+	if binding.ContractVersion != corev1alpha1.AgentRuntimeContractHarnessV2 ||
+		binding.Task.UID != acpTaskControlUID(task) ||
+		attempt.ID != attemptID || attempt.Key.Namespace != task.Namespace ||
+		attempt.Key.TaskUID != string(acpTaskControlUID(task)) ||
+		attempt.Key.Attempt != int64(execution.Attempt) || attempt.Key.PromptID != execution.PromptID ||
+		attempt.RequestDigest != execution.RequestDigest ||
+		attempt.BindingDigest != binding.BindingDigest || attempt.SnapshotDigest != binding.Snapshot.Digest ||
+		attempt.RuntimeInstanceID != execution.RuntimeInstanceID ||
+		attempt.SessionUID != execution.RuntimeSessionUID ||
+		attempt.SessionLeaseGeneration != execution.RuntimeSessionGeneration ||
+		attempt.DeliveryState != store.PromptDeliveryNotRequested {
+		return fmt.Errorf("%w: retired-before-dispatch PromptAttempt does not match the frozen Task", store.ErrConflict)
+	}
+	switch attempt.ExecutionState {
+	case store.PromptExecutionPlanned:
+		if attempt.TerminalReason != "" || attempt.OutcomeMarker != "" {
+			return fmt.Errorf("%w: planned retired-before-dispatch attempt already has terminal classification", store.ErrConflict)
+		}
+	case store.PromptExecutionCancelled:
+		if attempt.TerminalReason != string(acpRetiredBeforeDispatchReason) ||
+			attempt.OutcomeMarker != acpRetiredBeforeDispatchMessage {
+			return fmt.Errorf("%w: cancelled retired-before-dispatch attempt has different terminal classification", store.ErrConflict)
+		}
+	default:
+		return fmt.Errorf("%w: retired-before-dispatch PromptAttempt is %s", store.ErrConflict, attempt.ExecutionState)
+	}
+	return nil
+}
+
+func (r *TaskReconciler) acpTaskHasAnyExternalEffects(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	publicationID string,
+) (bool, error) {
+	if r.APIReader == nil {
+		return false, errors.New("authoritative API reader is required for retired-before-dispatch external-effect discovery")
+	}
+	var effects corev1alpha1.ExternalEffectList
+	if err := r.APIReader.List(ctx, &effects, client.InNamespace(task.Namespace)); err != nil {
+		return false, err
+	}
+	related := map[string]struct{}{string(acpTaskControlUID(task)): {}, publicationID: {}}
+	if task.Status.Execution != nil && task.Status.Execution.RuntimeSessionUID != "" {
+		related[task.Status.Execution.RuntimeSessionUID] = struct{}{}
+	}
+	for i := range effects.Items {
+		if storekube.ExternalEffectReferencesTask(&effects.Items[i], string(acpTaskControlUID(task)), related) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *TaskReconciler) acpTaskHasRuntimeSessionControl(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	attemptID string,
+) (bool, error) {
+	if r.APIReader == nil {
+		return false, errors.New("authoritative API reader is required for retired-before-dispatch session-control discovery")
+	}
+	var controls corev1alpha1.RuntimeSessionControlList
+	if err := r.APIReader.List(ctx, &controls, client.InNamespace(task.Namespace)); err != nil {
+		return false, err
+	}
+	taskUID := string(acpTaskControlUID(task))
+	sessionUID := task.Status.Execution.RuntimeSessionUID
+	for i := range controls.Items {
+		control := &controls.Items[i]
+		if control.Spec.Owner.UID == taskUID || control.Spec.SessionUID == sessionUID ||
+			control.Status.RelatedPromptAttemptID == attemptID ||
+			control.Status.MutationLease != nil && control.Status.MutationLease.TaskUID == taskUID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func acpTaskRequiresAuthoritativeAttemptDiscovery(task *corev1alpha1.Task) bool {
@@ -524,37 +728,42 @@ func (r *TaskReconciler) acpPromptAttemptReclamationRequest(
 			request.Mode = store.PromptAttemptReclamationNoAttempt
 			request.FinalContinuitySession = false
 		} else {
-			request.Mode = store.PromptAttemptReclamationProjected
 			attemptID, err := promptAttemptIDFromTaskUID(task, acpTaskControlUID(task))
 			if err != nil {
 				return store.ReclaimPromptAttemptsRequest{}, err
 			}
-			request.FinalPromptAttemptID = attemptID
 			attempt, err := r.DurableControlStore.GetPromptAttempt(ctx, attemptID)
 			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				return store.ReclaimPromptAttemptsRequest{}, err
 			}
-			if attempt != nil {
-				bound, bindingErr := promptAttemptSessionBound(attempt)
-				if bindingErr != nil {
-					return store.ReclaimPromptAttemptsRequest{}, bindingErr
-				}
-				request.FinalContinuitySession = task.Spec.SessionRef != nil && bound
+			if attempt == nil && acpTaskRetiredBeforeDurableAttempt(task) {
+				request.Mode = store.PromptAttemptReclamationNoAttempt
+				request.FinalContinuitySession = false
 			} else {
-				request.FinalContinuitySession = task.Spec.SessionRef != nil &&
-					task.Status.Execution.RuntimeSessionUID != "" && task.Status.Execution.RuntimeSessionGeneration > 0
-			}
-			if attempt == nil && task.Spec.SessionRef != nil && !request.FinalContinuitySession {
-				// The prepared marker is authoritative after the final attempt has
-				// been reclaimed; the Task projection alone cannot reconstruct the
-				// frozen SessionTurn identity.
-				request.TerminalProjectionID = ""
-			} else {
-				projectionID, err := r.acpTaskTerminalProjectionID(ctx, task, attempt)
-				if err != nil {
-					return store.ReclaimPromptAttemptsRequest{}, err
+				request.Mode = store.PromptAttemptReclamationProjected
+				request.FinalPromptAttemptID = attemptID
+				if attempt != nil {
+					bound, bindingErr := promptAttemptSessionBound(attempt)
+					if bindingErr != nil {
+						return store.ReclaimPromptAttemptsRequest{}, bindingErr
+					}
+					request.FinalContinuitySession = task.Spec.SessionRef != nil && bound
+				} else {
+					request.FinalContinuitySession = task.Spec.SessionRef != nil &&
+						task.Status.Execution.RuntimeSessionUID != "" && task.Status.Execution.RuntimeSessionGeneration > 0
 				}
-				request.TerminalProjectionID = projectionID
+				if attempt == nil && task.Spec.SessionRef != nil && !request.FinalContinuitySession {
+					// The prepared marker is authoritative after the final attempt has
+					// been reclaimed; the Task projection alone cannot reconstruct the
+					// frozen SessionTurn identity.
+					request.TerminalProjectionID = ""
+				} else {
+					projectionID, err := r.acpTaskTerminalProjectionID(ctx, task, attempt)
+					if err != nil {
+						return store.ReclaimPromptAttemptsRequest{}, err
+					}
+					request.TerminalProjectionID = projectionID
+				}
 			}
 		}
 	}

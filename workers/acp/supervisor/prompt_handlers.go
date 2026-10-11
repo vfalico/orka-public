@@ -2631,7 +2631,11 @@ func deactivatePromptCapabilities(state *sessionState, promptID harnessv2.Prompt
 	}
 }
 
-func settlementFromResult(result acp.PromptResult, at time.Time) harnessv2.PromptSettlement {
+func settlementFromResult(result acp.PromptResult, fallbackSettledAt time.Time) harnessv2.PromptSettlement {
+	at := fallbackSettledAt
+	if !result.SettledAt.IsZero() {
+		at = result.SettledAt
+	}
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}

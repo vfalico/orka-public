@@ -25,6 +25,38 @@ import (
 
 const testE2EPromptWriteAmbiguityMarker = "ORKA_E2E_WS_LC_AMBIGUOUS_OK"
 
+func TestSettlementFromResultPreservesAuthoritativeTimestamp(t *testing.T) {
+	settledAt := time.Date(2026, 10, 10, 21, 54, 44, 123456789, time.UTC)
+	observedAt := settledAt.Add(3 * time.Second)
+	result := acp.PromptResult{
+		Outcome:    acp.PromptOutcomeCompleted,
+		Accepted:   true,
+		StopReason: acp.StopReasonEndTurn,
+		SettledAt:  settledAt,
+	}
+
+	got := settlementFromResult(result, observedAt)
+	if !got.SettledAt.Equal(settledAt) {
+		t.Fatalf("settledAt = %s, want authoritative result timestamp %s", got.SettledAt, settledAt)
+	}
+	gotDigest, err := harnessv2.CanonicalPromptSettlementDigest(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, err := harnessv2.CanonicalPromptSettlementDigest(harnessv2.PromptSettlement{
+		TerminalEvent: harnessv2.EventCompleted,
+		Outcome:       harnessv2.PromptOutcomeSucceeded,
+		StopReason:    harnessv2.ACPStopReasonEndTurn,
+		SettledAt:     settledAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotDigest != wantDigest {
+		t.Fatalf("settlement digest = %s, want %s", gotDigest, wantDigest)
+	}
+}
+
 func TestRedactedPromptErrorDetailStripsC1ControlsBeforeRedaction(t *testing.T) {
 	t.Parallel()
 	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
@@ -887,6 +919,90 @@ func TestConcurrentDuplicateCancellationExecutesOnceAndPreservesSettlement(t *te
 	defer server.mu.Unlock()
 	if state.prompt.settlement.TerminalEvent != harnessv2.EventCompleted || state.descriptor.State != harnessv2.RuntimeSessionStateValidating {
 		t.Fatalf("terminal finisher overwrote settlement: state=%s settlement=%#v", state.descriptor.State, state.prompt.settlement)
+	}
+}
+
+func TestCompletedCancellationFirstWriterMatchesTerminalDigest(t *testing.T) {
+	server, cfg, profile := newTestServer(t, "immediate")
+	create := testCreateSessionRequest(t, cfg, profile)
+	created := performMutation(t, server.Handler(), http.MethodPut, "/v2/runtime-sessions/session-1", create, cfg)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", created.Code, created.Body.String())
+	}
+	prompt := testStartPromptRequest(t, cfg, create.Metadata.Fence)
+	settledAt := time.Now().UTC().Add(-3 * time.Second)
+	mutations := newBlockingPromptMutator()
+	mutations.cancelResult = acp.PromptResult{
+		Outcome:    acp.PromptOutcomeCompleted,
+		StopReason: acp.StopReasonEndTurn,
+		Accepted:   true,
+		SettledAt:  settledAt,
+	}
+	close(mutations.cancelRelease)
+
+	server.mu.Lock()
+	state := server.sessions[create.RuntimeSessionID]
+	state.prompt = &promptState{request: prompt}
+	state.descriptor.State = harnessv2.RuntimeSessionStatePromptRunning
+	state.promptMutations = mutations
+	server.mu.Unlock()
+
+	request := harnessv2.CancelPromptRequest{
+		Protocol: harnessv2.ProtocolVersion,
+		Metadata: testMetadata(create.Metadata.Fence, "cancel-operation-first-writer", true),
+		Reason:   harnessv2.CancelReasonUserRequested,
+	}
+	request.SettlementDeadline = time.Now().UTC().Add(30 * time.Second)
+	sealRequest(t, &request.Metadata.RequestDigest, request)
+	response := performMutation(
+		t,
+		server.Handler(),
+		http.MethodPut,
+		"/v2/runtime-sessions/session-1/prompts/prompt-1/cancel",
+		request,
+		cfg,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d body=%s", response.Code, response.Body.String())
+	}
+	var cancelled harnessv2.CancelPromptResponse
+	decodeResponse(t, response, &cancelled)
+	if cancelled.Settlement.TerminalEvent != harnessv2.EventCompleted || !cancelled.Settlement.SettledAt.Equal(settledAt) {
+		t.Fatalf("cancellation settlement = %#v, want completed at %s", cancelled.Settlement, settledAt)
+	}
+
+	terminal, settledResult, err := server.terminalEvent(state, state.prompt, mutations.cancelResult)
+	if err != nil {
+		t.Fatalf("terminal event after cancellation settlement: %v", err)
+	}
+	if terminal.Type != harnessv2.EventCompleted || !terminal.Identity.Timestamp.Equal(settledAt) {
+		t.Fatalf("terminal event = %#v, want completed at %s", terminal, settledAt)
+	}
+	controllerSettlement := harnessv2.PromptSettlement{
+		TerminalEvent: terminal.Type,
+		Outcome:       harnessv2.PromptOutcomeSucceeded,
+		StopReason:    terminal.Completed.StopReason,
+		SettledAt:     terminal.Identity.Timestamp,
+	}
+	cancelDigest, err := harnessv2.CanonicalPromptSettlementDigest(cancelled.Settlement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controllerDigest, err := harnessv2.CanonicalPromptSettlementDigest(controllerSettlement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelDigest != controllerDigest {
+		t.Fatalf("cancellation digest = %s, controller digest = %s", cancelDigest, controllerDigest)
+	}
+
+	server.finishPrompt(state, state.prompt, settledResult, terminal.Identity.Timestamp)
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if state.descriptor.State != harnessv2.RuntimeSessionStateValidating ||
+		state.prompt.settlement == nil ||
+		!state.prompt.settlement.SettledAt.Equal(settledAt) {
+		t.Fatalf("final state=%s settlement=%#v", state.descriptor.State, state.prompt.settlement)
 	}
 }
 
