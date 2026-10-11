@@ -51,7 +51,6 @@ spec:
           metadata:
             type: object
           spec:
-            description: TaskSpec defines the desired state of Task
             properties:
               agentRef:
                 description: AgentRef references an Agent CRD for configuration
@@ -1572,6 +1571,25 @@ spec:
               image:
                 description: Image is the container image to run for the task
                 type: string
+              policyBindingRef:
+                description: PolicyBindingRef opts this Task into fail-closed policy
+                  admission.
+                properties:
+                  digest:
+                    type: string
+                  name:
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - digest
+                - name
+                - uid
+                type: object
               priorTaskRef:
                 description: |-
                   PriorTaskRef references a previously completed task whose diff should be
@@ -2141,6 +2159,9 @@ spec:
                 || self.transaction == oldSelf.transaction)
             - message: type is immutable
               rule: self.type == oldSelf.type
+            - message: policyBindingRef is immutable
+              rule: has(self.policyBindingRef) == has(oldSelf.policyBindingRef) &&
+                (!has(self.policyBindingRef) || self.policyBindingRef == oldSelf.policyBindingRef)
             - message: effective workspace intent is immutable
               rule: '(has(self.workspace) && has(self.workspace.intent) ? self.workspace.intent
                 : (self.type == ''agent'' ? ''read'' : self.type)) == (has(oldSelf.workspace)
@@ -2760,6 +2781,65 @@ spec:
                     - Cancelled
                     - OutcomeUnknown
                     type: string
+                  policyActivation:
+                    description: PolicyActivation is durable structured IG evidence,
+                      verified before provider exec.
+                    properties:
+                      attachments:
+                        items:
+                          description: TaskPolicyAttachmentEvidence is kernel-assigned
+                            readback for one live policy link.
+                          properties:
+                            attachType:
+                              type: string
+                            linkID:
+                              format: int32
+                              type: integer
+                            programID:
+                              format: int32
+                              type: integer
+                            programName:
+                              type: string
+                            target:
+                              type: string
+                          required:
+                          - attachType
+                          - linkID
+                          - programID
+                          - programName
+                          - target
+                          type: object
+                        type: array
+                      cgroupID:
+                        format: int64
+                        type: integer
+                      policyDigest:
+                        type: string
+                      receiptDigest:
+                        type: string
+                      runtimeSessionID:
+                        type: string
+                      taskAttempt:
+                        format: int32
+                        type: integer
+                      taskUID:
+                        type: string
+                      verifiedAt:
+                        format: date-time
+                        type: string
+                      version:
+                        type: string
+                    required:
+                    - attachments
+                    - cgroupID
+                    - policyDigest
+                    - receiptDigest
+                    - runtimeSessionID
+                    - taskAttempt
+                    - taskUID
+                    - verifiedAt
+                    - version
+                    type: object
                   promptID:
                     description: PromptID is the durable prompt identity used for
                       submission and settlement.

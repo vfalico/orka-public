@@ -326,6 +326,13 @@ func main() {
 	var acpClaudeRuntimeImage string
 	var acpCopilotRuntimeImage string
 	var acpOpencodeRuntimeImage string
+	var agentPolicyGuarddSocketHostPath string
+	var agentPolicyAuthorizationIssuerID string
+	var agentPolicyAuthorizationPrivateKeyHostPath string
+	var agentPolicyReceiptPublicKeyHostPath string
+	var agentPolicyReceiptDirectoryHostPath string
+	var agentPolicyGadgetDigest string
+	var agentPolicyCgroupRoot string
 	var acpRuntimeNamespace string
 	var acpProviderProxyNamespace string
 	var acpProviderProxyBaseURL string
@@ -583,6 +590,20 @@ func main() {
 		"Copilot ACP runtime image with a tag or SHA256 digest. Tags resolve to digests at startup.")
 	flag.StringVar(&acpOpencodeRuntimeImage, "acp-opencode-runtime-image", os.Getenv("ORKA_ACP_OPENCODE_RUNTIME_IMAGE"),
 		"OpenCode ACP runtime image with a tag or SHA256 digest. Tags resolve to digests at startup.")
+	flag.StringVar(&agentPolicyGuarddSocketHostPath, "agent-policy-guardd-socket-host-path", os.Getenv("ORKA_AGENT_POLICY_GUARDD_SOCKET_HOST_PATH"),
+		"Node-local guardd Unix socket mounted into managed runtimes. Configure all AgentPolicy flags together.")
+	flag.StringVar(&agentPolicyAuthorizationIssuerID, "agent-policy-authorization-issuer-id", os.Getenv("ORKA_AGENT_POLICY_AUTHORIZATION_ISSUER_ID"),
+		"Exact issuer ID accepted by node-local guardd.")
+	flag.StringVar(&agentPolicyAuthorizationPrivateKeyHostPath, "agent-policy-authorization-private-key-host-path", os.Getenv("ORKA_AGENT_POLICY_AUTHORIZATION_PRIVATE_KEY_HOST_PATH"),
+		"Node-local Orka authorization private-key file mounted read-only into managed runtimes.")
+	flag.StringVar(&agentPolicyReceiptPublicKeyHostPath, "agent-policy-receipt-public-key-host-path", os.Getenv("ORKA_AGENT_POLICY_RECEIPT_PUBLIC_KEY_HOST_PATH"),
+		"Node-local guardd receipt public-key file mounted read-only into managed runtimes.")
+	flag.StringVar(&agentPolicyReceiptDirectoryHostPath, "agent-policy-receipt-directory-host-path", os.Getenv("ORKA_AGENT_POLICY_RECEIPT_DIRECTORY_HOST_PATH"),
+		"Node-local Orka receipt directory mounted read-write into managed runtimes.")
+	flag.StringVar(&agentPolicyGadgetDigest, "agent-policy-gadget-digest", os.Getenv("ORKA_AGENT_POLICY_GADGET_DIGEST"),
+		"Exact sha256 digest of the guardd-loaded AgentPolicy gadget.")
+	flag.StringVar(&agentPolicyCgroupRoot, "agent-policy-cgroup-root", os.Getenv("ORKA_AGENT_POLICY_CGROUP_ROOT"),
+		"Node-local cgroup-v2 subtree used for held AgentPolicy executions.")
 	flag.StringVar(&acpRuntimeNamespace, "acp-runtime-namespace", envutil.String("ORKA_ACP_RUNTIME_NAMESPACE", "orka-runtimes"),
 		"Physical namespace for managed ACP runtime Pods.")
 	flag.StringVar(&acpProviderProxyNamespace, "acp-provider-proxy-namespace", os.Getenv("ORKA_ACP_PROVIDER_PROXY_NAMESPACE"),
@@ -830,6 +851,19 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	acpUpgradeDrainOptions.BindFlags(flag.CommandLine)
 	flag.Parse()
+	agentPolicyConfig := controller.RuntimePoolAgentPolicyConfig{
+		GuarddSocketHostPath:            agentPolicyGuarddSocketHostPath,
+		AuthorizationIssuerID:           agentPolicyAuthorizationIssuerID,
+		AuthorizationPrivateKeyHostPath: agentPolicyAuthorizationPrivateKeyHostPath,
+		ReceiptPublicKeyHostPath:        agentPolicyReceiptPublicKeyHostPath,
+		ReceiptDirectoryHostPath:        agentPolicyReceiptDirectoryHostPath,
+		GadgetDigest:                    agentPolicyGadgetDigest,
+		CgroupRoot:                      agentPolicyCgroupRoot,
+	}
+	if err := agentPolicyConfig.Validate(); err != nil {
+		setupLog.Error(err, "invalid AgentPolicy guardd configuration")
+		os.Exit(1)
+	}
 	taskProvenanceProtected := taskProvenanceAdmissionEnabled || taskProvenanceAdmissionExternal
 	if handled, err := controller.RunACPUpgradeDrainTriggerMode(context.Background(), acpUpgradeDrainOptions); handled {
 		if err != nil {
@@ -1734,6 +1768,7 @@ func main() {
 			BearerTokenFile: acpProviderProxyTokenFile,
 		}
 		runtimePoolReconciler.Epochs = controllerEpochManager
+		runtimePoolReconciler.AgentPolicy = agentPolicyConfig
 		runtimePoolReconciler.EnablePDB = true
 		runtimePoolReconciler.EnableTelemetry = enableTracing
 		runtimePoolReconciler.E2EPromptWriteAmbiguityMarker = acpE2EPromptWriteAmbiguityMarker
@@ -1838,6 +1873,11 @@ func main() {
 			contextTokenAuthzConfig.SecretCredentialReadScopes()...,
 		),
 		OutboundAccessTrust: outboundAccessTrust,
+		PolicyGate:          controller.KubernetesTaskPolicyGate{Reader: mgr.GetAPIReader()},
+	}
+	if err := (&controller.AgentPolicyBindingReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "AgentPolicyBinding")
+		os.Exit(1)
 	}
 	if err := taskReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Task")

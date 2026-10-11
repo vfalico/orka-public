@@ -20,14 +20,20 @@ func RunExecHelper(_, _ []string) error {
 }
 
 func childSysProcAttr(_, _ int) *syscall.SysProcAttr { return &syscall.SysProcAttr{} }
-func signalProcessGroup(_ int, _ os.Signal) error    { return syscall.EWINDOWS }
-func terminateSignal() os.Signal                     { return os.Interrupt }
-func killSignal() os.Signal                          { return os.Kill }
-func stopSignal() os.Signal                          { return os.Interrupt }
-func continueSignal() os.Signal                      { return os.Interrupt }
-func processesForUID(_ int) ([]int, bool)            { return nil, false }
-func reapExitedProcessesForUID(_ int)                {}
-func reapExitedProcessesForUIDExcept(_, _ int)       {}
+func signalProcess(_ int, _ os.Signal) error {
+	return fmt.Errorf("pre-exec policy activation is only supported on Linux")
+}
+func waitForPolicyStop(_ int) error {
+	return fmt.Errorf("pre-exec policy activation is only supported on Linux")
+}
+func signalProcessGroup(_ int, _ os.Signal) error { return syscall.EWINDOWS }
+func terminateSignal() os.Signal                  { return os.Interrupt }
+func killSignal() os.Signal                       { return os.Kill }
+func stopSignal() os.Signal                       { return os.Interrupt }
+func continueSignal() os.Signal                   { return os.Interrupt }
+func processesForUID(_ int) ([]int, bool)         { return nil, false }
+func reapExitedProcessesForUID(_ int)             {}
+func reapExitedProcessesForUIDExcept(_, _ int)    {}
 
 func processesStoppedForUID(_, _ int) (bool, bool, error) { return false, false, nil }
 func processesResumedForUID(_, _ int) (bool, bool, error) { return false, false, nil }

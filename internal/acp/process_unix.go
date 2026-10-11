@@ -27,6 +27,12 @@ func childSysProcAttr(uid, gid int) *syscall.SysProcAttr {
 	return attr
 }
 
+func signalProcess(_ int, _ os.Signal) error {
+	return fmt.Errorf("pre-exec policy activation is only supported on Linux")
+}
+func waitForPolicyStop(_ int) error {
+	return fmt.Errorf("pre-exec policy activation is only supported on Linux")
+}
 func signalProcessGroup(pid int, signal os.Signal) error {
 	sig, ok := signal.(syscall.Signal)
 	if !ok {

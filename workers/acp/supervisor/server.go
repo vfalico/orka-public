@@ -384,6 +384,9 @@ func newServer(cfg Config, prepareIdentityState func(string, *acp.UIDAllocator) 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if err := validateAgentPolicyStartup(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.UIDAllocator.Remaining() != cfg.UIDAllocator.Capacity() {
 		return nil, fmt.Errorf("UID allocator must be fresh when the supervisor starts")
 	}
@@ -652,6 +655,7 @@ func (s *Server) status() harnessv2.StatusResponse {
 			ReservedForFinalization: state.descriptor.State == harnessv2.RuntimeSessionStateFinalizing && state.publicationFinalization != nil,
 			LiveDescendantCount:     liveDescendantCount(state.runtime),
 			LastTransitionAt:        state.descriptor.LastTransitionAt,
+			AgentPolicyReceipt:      state.descriptor.AgentPolicyReceipt,
 		}
 		if state.descriptor.State == harnessv2.RuntimeSessionStatePromptRunning && state.prompt != nil && state.prompt.settlement == nil {
 			status.ActivePromptID = state.prompt.request.Metadata.PromptID
@@ -1182,18 +1186,34 @@ func (s *Server) createSession(
 			return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, nil, sessionCreationFailed("durable workspace pending mark", err)
 		}
 	}
+	var policyReceipt *harnessv2.AgentPolicyReceipt
+	var activatePolicy func(int) (io.Closer, error)
+	if request.AgentPolicy != nil {
+		if s.cfg.AgentPolicyGuarddSocket == "" {
+			return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, nil, sessionCreationFailed("AgentPolicy activation", errors.New("runtime does not configure ig-kmx-guardd"))
+		}
+		activatePolicy = func(pid int) (io.Closer, error) {
+			guarddConfig := guarddRuntimeConfig{SocketPath: s.cfg.AgentPolicyGuarddSocket, AuthorizationIssuerID: s.cfg.AgentPolicyAuthorizationIssuerID, AuthorizationPrivateKeyFile: s.cfg.AgentPolicyAuthorizationPrivateKeyFile, ReceiptPublicKeyFile: s.cfg.AgentPolicyReceiptPublicKeyFile, ReceiptDirectory: s.cfg.AgentPolicyReceiptDirectory, GadgetDigest: s.cfg.AgentPolicyGadgetDigest, NodeID: s.cfg.AgentPolicyNodeID, CgroupRoot: s.cfg.AgentPolicyCgroupRoot}
+			lifetime, receipt, err := activateAgentPolicy(ctx, guarddConfig, *request.AgentPolicy, request.Metadata, string(request.RuntimeSessionID), pid)
+			if err == nil {
+				policyReceipt = receipt
+			}
+			return lifetime, err
+		}
+	}
 	runtimeSession, err := acp.NewRuntimeSession(ctx, acp.RuntimeSessionConfig{
 		ID:            string(request.RuntimeSessionID),
 		Generation:    int64(request.Metadata.Fence.RuntimeSessionGeneration),
 		ProfileDigest: string(request.Metadata.Fence.RuntimeProfileDigest),
 		Process: acp.ProcessConfig{
-			Command:       s.cfg.Provider.Command,
-			Args:          append(append([]string(nil), s.cfg.Provider.Args...), projection.AdditionalArgs...),
-			Environment:   environment,
-			Paths:         paths,
-			UID:           uid,
-			GID:           gid,
-			ClientOptions: acp.Options{MaxMessageBytes: s.cfg.Capabilities.Limits.MaxRequestBytes},
+			Command:        s.cfg.Provider.Command,
+			Args:           append(append([]string(nil), s.cfg.Provider.Args...), projection.AdditionalArgs...),
+			Environment:    environment,
+			Paths:          paths,
+			UID:            uid,
+			GID:            gid,
+			ClientOptions:  acp.Options{MaxMessageBytes: s.cfg.Capabilities.Limits.MaxRequestBytes},
+			ActivatePolicy: activatePolicy,
 		},
 		MCPServers:            []acp.MCPServer{mcpServer},
 		NewSessionMeta:        projection.NewSessionMeta,
@@ -1252,6 +1272,7 @@ func (s *Server) createSession(
 		WorkspaceBaseline:    request.Workspace.Baseline,
 		CreatedAt:            now,
 		LastTransitionAt:     now,
+		AgentPolicyReceipt:   policyReceipt,
 	}
 	return runtimeSession, descriptor, paths, baseline, providerProxy, mcpProxy, projection.AgentDiagnosticFilter, nil
 }

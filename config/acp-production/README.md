@@ -51,3 +51,18 @@ the controller rollout before removing the webhook configuration.
 For same-cluster v1/v2 operation, deploy v1 as a separate release with a
 different release namespace, watched namespace, endpoint, RBAC, storage, and
 data plane. See `docs/harness-v1-v2-coexistence-plan.md`.
+
+## AgentPolicy kernel boundary
+
+guardd is installed as a node-local systemd service and remains the sole
+privileged IG actuator. Enable the controller's `--agent-policy-*` flags only
+as one complete tuple: the exact guardd socket, Orka authorization private key,
+guardd receipt public key, Orka receipt directory, issuer ID, gadget digest,
+and cgroup root. The managed runtime mounts only those explicit host objects
+plus the host cgroup-v2 tree; there is no adapter init container. The supervisor
+derives node identity from `spec.nodeName`, creates an exact per-execution child
+cgroup, starts the provider stopped, verifies and persists the guardd receipt,
+and only then releases execution. Do not co-locate unrelated workloads in the
+dedicated `orka-runtimes` namespace. Pre-create the receipt directory as
+root-owned mode `0700`; the Pod refuses to start when any configured host object
+is absent.

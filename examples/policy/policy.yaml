@@ -1,0 +1,13 @@
+apiVersion: core.orka.ai/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: workspace-write
+spec:
+  uid: workspace-write-v1
+  denyWriteObjects:
+  - path: /workspace/locked.txt
+  violationResponse:
+    action: deny
+    threshold: 1
+  requiredCapabilities:
+  - ig.agent-policy/file-permission/v1

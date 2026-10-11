@@ -18,6 +18,20 @@
 {{- include "orka.validateACPRuntimeImage" (dict "name" "controller.acpRuntime.claudeImage" "ref" .Values.controller.acpRuntime.claudeImage) }}
 {{- include "orka.validateACPRuntimeImage" (dict "name" "controller.acpRuntime.copilotImage" "ref" .Values.controller.acpRuntime.copilotImage) }}
 {{- include "orka.validateACPRuntimeImage" (dict "name" "controller.acpRuntime.opencodeImage" "ref" .Values.controller.acpRuntime.opencodeImage) }}
+{{- $agentPolicy := .Values.controller.acpRuntime.agentPolicy -}}
+{{- $agentPolicyConfigured := or $agentPolicy.guarddSocketHostPath $agentPolicy.authorizationIssuerID $agentPolicy.authorizationPrivateKeyHostPath $agentPolicy.receiptPublicKeyHostPath $agentPolicy.receiptDirectoryHostPath $agentPolicy.gadgetDigest $agentPolicy.cgroupRoot -}}
+{{- if $agentPolicyConfigured }}
+{{- if not $agentPolicy.guarddSocketHostPath }}{{- fail "controller.acpRuntime.agentPolicy.guarddSocketHostPath is required when AgentPolicy is enabled" }}{{- end }}
+{{- if not $agentPolicy.authorizationIssuerID }}{{- fail "controller.acpRuntime.agentPolicy.authorizationIssuerID is required when AgentPolicy is enabled" }}{{- end }}
+{{- if not $agentPolicy.authorizationPrivateKeyHostPath }}{{- fail "controller.acpRuntime.agentPolicy.authorizationPrivateKeyHostPath is required when AgentPolicy is enabled" }}{{- end }}
+{{- if not $agentPolicy.receiptPublicKeyHostPath }}{{- fail "controller.acpRuntime.agentPolicy.receiptPublicKeyHostPath is required when AgentPolicy is enabled" }}{{- end }}
+{{- if not $agentPolicy.receiptDirectoryHostPath }}{{- fail "controller.acpRuntime.agentPolicy.receiptDirectoryHostPath is required when AgentPolicy is enabled" }}{{- end }}
+{{- if not $agentPolicy.gadgetDigest }}{{- fail "controller.acpRuntime.agentPolicy.gadgetDigest is required when AgentPolicy is enabled" }}{{- end }}
+{{- if not $agentPolicy.cgroupRoot }}{{- fail "controller.acpRuntime.agentPolicy.cgroupRoot is required when AgentPolicy is enabled" }}{{- end }}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $agentPolicy.gadgetDigest) }}
+{{- fail "controller.acpRuntime.agentPolicy.gadgetDigest must be sha256:<64 lowercase hex>" }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- $gatewayCRDsReady := false -}}
 {{- if and $harnessV2 .Values.controller.gateway.enabled (not .Values.controller.gateway.crdsReadyOverride) -}}
@@ -145,6 +159,16 @@ spec:
             {{- end }}
             {{- if .Values.controller.acpRuntime.opencodeImage }}
             - {{ printf "--acp-opencode-runtime-image=%s" .Values.controller.acpRuntime.opencodeImage | quote }}
+            {{- end }}
+            {{- $agentPolicy := .Values.controller.acpRuntime.agentPolicy -}}
+            {{- if or $agentPolicy.guarddSocketHostPath $agentPolicy.authorizationIssuerID $agentPolicy.authorizationPrivateKeyHostPath $agentPolicy.receiptPublicKeyHostPath $agentPolicy.receiptDirectoryHostPath $agentPolicy.gadgetDigest $agentPolicy.cgroupRoot }}
+            - {{ printf "--agent-policy-guardd-socket-host-path=%s" .Values.controller.acpRuntime.agentPolicy.guarddSocketHostPath | quote }}
+            - {{ printf "--agent-policy-authorization-issuer-id=%s" .Values.controller.acpRuntime.agentPolicy.authorizationIssuerID | quote }}
+            - {{ printf "--agent-policy-authorization-private-key-host-path=%s" .Values.controller.acpRuntime.agentPolicy.authorizationPrivateKeyHostPath | quote }}
+            - {{ printf "--agent-policy-receipt-public-key-host-path=%s" .Values.controller.acpRuntime.agentPolicy.receiptPublicKeyHostPath | quote }}
+            - {{ printf "--agent-policy-receipt-directory-host-path=%s" .Values.controller.acpRuntime.agentPolicy.receiptDirectoryHostPath | quote }}
+            - {{ printf "--agent-policy-gadget-digest=%s" .Values.controller.acpRuntime.agentPolicy.gadgetDigest | quote }}
+            - {{ printf "--agent-policy-cgroup-root=%s" .Values.controller.acpRuntime.agentPolicy.cgroupRoot | quote }}
             {{- end }}
             - --zap-log-level={{ .Values.controller.logLevel }}
             - --gateway-enabled={{ $gatewayRuntimeEnabled }}

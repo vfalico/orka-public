@@ -76,16 +76,24 @@ const (
 	// The *_BOOTSTRAP variables carry read-once secrets for provider-hosted
 	// supervisors (for example Substrate Actors) that have no Kubernetes
 	// Secret mounts. The corresponding *_FILE variable always wins when set.
-	EnvControllerTokenBootstrap  = "ORKA_ACP_CONTROLLER_TOKEN_BOOTSTRAP"
-	EnvCapabilitySecretBootstrap = "ORKA_ACP_CAPABILITY_SECRET_BOOTSTRAP"
-	EnvProviderTokenBootstrap    = "ORKA_ACP_PROVIDER_TOKEN_BOOTSTRAP"
-	EnvSessionBaseDir            = "ORKA_ACP_SESSION_BASE_DIR"
-	EnvDurableWorkspaceDir       = "ORKA_ACP_DURABLE_WORKSPACE_DIR"
-	EnvDurableWorkspaceKey       = "ORKA_ACP_DURABLE_WORKSPACE_KEY"
-	EnvFirstSessionUID           = "ORKA_ACP_FIRST_SESSION_UID"
-	EnvLastSessionUID            = "ORKA_ACP_LAST_SESSION_UID"
-	EnvSessionGID                = "ORKA_ACP_SESSION_GID"
-	EnvE2EPromptWriteAmbiguity   = "ORKA_ACP_E2E_PROMPT_WRITE_AMBIGUITY_MARKER"
+	EnvControllerTokenBootstrap           = "ORKA_ACP_CONTROLLER_TOKEN_BOOTSTRAP"
+	EnvCapabilitySecretBootstrap          = "ORKA_ACP_CAPABILITY_SECRET_BOOTSTRAP"
+	EnvProviderTokenBootstrap             = "ORKA_ACP_PROVIDER_TOKEN_BOOTSTRAP"
+	EnvSessionBaseDir                     = "ORKA_ACP_SESSION_BASE_DIR"
+	EnvDurableWorkspaceDir                = "ORKA_ACP_DURABLE_WORKSPACE_DIR"
+	EnvDurableWorkspaceKey                = "ORKA_ACP_DURABLE_WORKSPACE_KEY"
+	EnvFirstSessionUID                    = "ORKA_ACP_FIRST_SESSION_UID"
+	EnvLastSessionUID                     = "ORKA_ACP_LAST_SESSION_UID"
+	EnvSessionGID                         = "ORKA_ACP_SESSION_GID"
+	EnvE2EPromptWriteAmbiguity            = "ORKA_ACP_E2E_PROMPT_WRITE_AMBIGUITY_MARKER"
+	EnvAgentPolicyGuarddSocket            = "ORKA_ACP_AGENT_POLICY_GUARDD_SOCKET"
+	EnvAgentPolicyAuthorizationIssuerID   = "ORKA_ACP_AGENT_POLICY_AUTHORIZATION_ISSUER_ID"
+	EnvAgentPolicyAuthorizationPrivateKey = "ORKA_ACP_AGENT_POLICY_AUTHORIZATION_PRIVATE_KEY_FILE"
+	EnvAgentPolicyReceiptPublicKey        = "ORKA_ACP_AGENT_POLICY_RECEIPT_PUBLIC_KEY_FILE"
+	EnvAgentPolicyReceiptDirectory        = "ORKA_ACP_AGENT_POLICY_RECEIPT_DIRECTORY"
+	EnvAgentPolicyGadgetDigest            = "ORKA_ACP_AGENT_POLICY_GADGET_DIGEST"
+	EnvAgentPolicyNodeID                  = "ORKA_ACP_AGENT_POLICY_NODE_ID"
+	EnvAgentPolicyCgroupRoot              = "ORKA_ACP_AGENT_POLICY_CGROUP_ROOT"
 
 	openCodeProviderID          = "orka"
 	openCodeProviderEnvName     = "ORKA_OPENCODE_PROVIDER_TOKEN"
@@ -330,11 +338,19 @@ func LoadConfigFromEnv() (Config, error) {
 			UpstreamBaseURL: providerUpstreamBaseURL(providerKind, providerBaseURL), UpstreamBearerToken: providerToken,
 			ProviderKind: providerKind, Model: model,
 		},
-		MCPBroker:                     mcpBroker,
-		WorkspaceMaterializer:         workspaceMaterializer,
-		ArtifactUploader:              artifactUploader,
-		E2EPromptWriteFaultRecorder:   e2ePromptWriteFaultRecorder,
-		E2EPromptWriteAmbiguityMarker: e2ePromptWriteAmbiguityMarker,
+		MCPBroker:                              mcpBroker,
+		WorkspaceMaterializer:                  workspaceMaterializer,
+		ArtifactUploader:                       artifactUploader,
+		E2EPromptWriteFaultRecorder:            e2ePromptWriteFaultRecorder,
+		E2EPromptWriteAmbiguityMarker:          e2ePromptWriteAmbiguityMarker,
+		AgentPolicyGuarddSocket:                envutil.String(EnvAgentPolicyGuarddSocket, ""),
+		AgentPolicyAuthorizationIssuerID:       envutil.String(EnvAgentPolicyAuthorizationIssuerID, ""),
+		AgentPolicyAuthorizationPrivateKeyFile: envutil.String(EnvAgentPolicyAuthorizationPrivateKey, ""),
+		AgentPolicyReceiptPublicKeyFile:        envutil.String(EnvAgentPolicyReceiptPublicKey, ""),
+		AgentPolicyReceiptDirectory:            envutil.String(EnvAgentPolicyReceiptDirectory, ""),
+		AgentPolicyGadgetDigest:                envutil.String(EnvAgentPolicyGadgetDigest, ""),
+		AgentPolicyNodeID:                      envutil.String(EnvAgentPolicyNodeID, ""),
+		AgentPolicyCgroupRoot:                  envutil.String(EnvAgentPolicyCgroupRoot, ""),
 	}
 	cfg.ProviderProxy.ModelOutputLimit = modelOutputLimit
 	if providerKind == providerKindFoundry {

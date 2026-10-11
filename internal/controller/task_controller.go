@@ -179,11 +179,15 @@ type TaskReconciler struct {
 	EnforceTransactionCredentialAuth  bool
 	TransactionCredentialReadScopes   []string
 	OutboundAccessTrust               outboundaccess.TrustConfig
+	PolicyGate                        TaskPolicyGate
 	trustedServiceCleanupMu           sync.RWMutex
 	trustedServiceCleanupDone         bool
 }
 
 // +kubebuilder:rbac:groups=core.orka.ai,resources=tasks,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core.orka.ai,resources=agentpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core.orka.ai,resources=agentpolicybindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core.orka.ai,resources=agentpolicybindings/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core.orka.ai,resources=tasks/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core.orka.ai,resources=tasks/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core.orka.ai,resources=agents,verbs=get;list;watch
@@ -726,6 +730,18 @@ func (r *TaskReconciler) handlePending(ctx context.Context, task *corev1alpha1.T
 	if err := r.clearApprovalDecisionNudge(ctx, task); err != nil {
 		log.Error(err, "failed to clear durable approval decision nudge")
 		return ctrl.Result{}, err
+	}
+
+	if task.Spec.PolicyBindingRef != nil {
+		if r.PolicyGate == nil {
+			return r.completeTask(ctx, task, corev1alpha1.TaskPhaseFailed, "policy enforcement is not configured")
+		}
+		if err := r.PolicyGate.Admit(ctx, task); err != nil {
+			if errors.Is(err, errPolicyActivationPending) {
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			return r.completeTask(ctx, task, corev1alpha1.TaskPhaseFailed, "policy admission failed: "+err.Error())
+		}
 	}
 
 	if taskTransactionTokenPending(task) {

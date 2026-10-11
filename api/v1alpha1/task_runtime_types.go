@@ -244,6 +244,10 @@ type TaskExecutionStatus struct {
 	// +kubebuilder:validation:MaxLength=253
 	ForgeCredentialResourceVersion string `json:"forgeCredentialResourceVersion,omitempty"`
 
+	// PolicyActivation is durable structured IG evidence, verified before provider exec.
+	// +optional
+	PolicyActivation *TaskPolicyActivationStatus `json:"policyActivation,omitempty"`
+
 	// Message contains bounded, sanitized execution context.
 	// +kubebuilder:validation:MaxLength=1024
 	// +optional
@@ -429,4 +433,26 @@ type TaskDeliveryStatus struct {
 	// LastTransitionTime is the last durable delivery-state transition time.
 	// +optional
 	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+}
+
+// TaskPolicyAttachmentEvidence is kernel-assigned readback for one live policy link.
+type TaskPolicyAttachmentEvidence struct {
+	ProgramName string `json:"programName"`
+	ProgramID   uint32 `json:"programID"`
+	LinkID      uint32 `json:"linkID"`
+	AttachType  string `json:"attachType"`
+	Target      string `json:"target"`
+}
+
+// TaskPolicyActivationStatus durably binds verified runtime evidence to one attempt.
+type TaskPolicyActivationStatus struct {
+	Version          string                         `json:"version"`
+	PolicyDigest     string                         `json:"policyDigest"`
+	TaskUID          string                         `json:"taskUID"`
+	TaskAttempt      uint32                         `json:"taskAttempt"`
+	RuntimeSessionID string                         `json:"runtimeSessionID"`
+	CgroupID         uint64                         `json:"cgroupID"`
+	Attachments      []TaskPolicyAttachmentEvidence `json:"attachments"`
+	ReceiptDigest    string                         `json:"receiptDigest"`
+	VerifiedAt       metav1.Time                    `json:"verifiedAt"`
 }

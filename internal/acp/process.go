@@ -35,6 +35,8 @@ type ProcessConfig struct {
 	StderrLimit       int
 	ClientOptions     Options
 	ExecHelperCommand string
+	// ActivatePolicy runs while the trusted exec helper is stopped, before provider exec.
+	ActivatePolicy func(pid int) (io.Closer, error)
 }
 
 type Process struct {
@@ -43,10 +45,11 @@ type Process struct {
 	stderr *boundedBuffer
 	uid    int
 
-	done     chan struct{}
-	waitMu   sync.Mutex
-	waitErr  error
-	stopOnce sync.Once
+	done             chan struct{}
+	waitMu           sync.Mutex
+	waitErr          error
+	stopOnce         sync.Once
+	policyActivation io.Closer
 }
 
 type CleanupStatus struct {
@@ -93,12 +96,38 @@ func StartProcess(cfg ProcessConfig) (*Process, error) {
 		_ = stdout.Close()
 		return nil, fmt.Errorf("start ACP adapter: %w", err)
 	}
+	var activation io.Closer
+	if cfg.ActivatePolicy != nil {
+		if err := waitForPolicyStop(cmd.Process.Pid); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return nil, fmt.Errorf("hold ACP adapter for policy activation: %w", err)
+		}
+		activation, err = cfg.ActivatePolicy(cmd.Process.Pid)
+		if err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return nil, fmt.Errorf("activate ACP policy before exec: %w", err)
+		}
+		if activation == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return nil, fmt.Errorf("activate ACP policy before exec returned no lifetime handle")
+		}
+		if err := signalProcess(cmd.Process.Pid, continueSignal()); err != nil {
+			_ = activation.Close()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return nil, fmt.Errorf("release policy-activated ACP adapter: %w", err)
+		}
+	}
 	process := &Process{
-		cmd:    cmd,
-		client: NewClient(stdout, stdin, cfg.ClientOptions),
-		stderr: stderr,
-		uid:    cfg.UID,
-		done:   make(chan struct{}),
+		cmd:              cmd,
+		client:           NewClient(stdout, stdin, cfg.ClientOptions),
+		stderr:           stderr,
+		uid:              cfg.UID,
+		policyActivation: activation,
+		done:             make(chan struct{}),
 	}
 	go func() {
 		err := cmd.Wait()
@@ -149,6 +178,12 @@ func (p *Process) Wait(ctx context.Context) error {
 }
 
 func (p *Process) Stop(ctx context.Context, grace time.Duration) (CleanupStatus, error) {
+	defer func() {
+		if p != nil && p.policyActivation != nil {
+			_ = p.policyActivation.Close()
+			p.policyActivation = nil
+		}
+	}()
 	if p == nil || p.cmd == nil || p.cmd.Process == nil {
 		return CleanupStatus{Proven: true}, nil
 	}

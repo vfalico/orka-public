@@ -5,9 +5,9 @@ metadata:
     app.kubernetes.io/component: acp-runtime
     app.kubernetes.io/managed-by: kustomize
     app.kubernetes.io/name: orka
-    pod-security.kubernetes.io/audit: restricted
-    pod-security.kubernetes.io/enforce: baseline
-    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
   name: orka-runtimes
 ---
 apiVersion: v1
@@ -1140,6 +1140,43 @@ rules:
 - apiGroups:
   - core.orka.ai
   resources:
+  - agentpolicies
+  - agentpolicybindings
+  - outboundaccesspolicies
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - agentpolicybindings/status
+  - agentruntimes/status
+  - agents/status
+  - branchclaims/status
+  - connections/status
+  - connectorproviders/status
+  - controllerepochs/status
+  - externaleffects/status
+  - outboundaccesspolicies/status
+  - promptattempts/status
+  - providers/status
+  - publications/status
+  - repositorymonitors/status
+  - repositoryscans/status
+  - runtimepools/status
+  - runtimesessioncontrols/status
+  - skills/status
+  - substrateactorpools/status
+  - tasks/status
+  - tools/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - core.orka.ai
+  resources:
   - agentruntimes
   - agents
   - branchclaims
@@ -1192,46 +1229,12 @@ rules:
 - apiGroups:
   - core.orka.ai
   resources:
-  - agentruntimes/status
-  - agents/status
-  - branchclaims/status
-  - connections/status
-  - connectorproviders/status
-  - controllerepochs/status
-  - externaleffects/status
-  - outboundaccesspolicies/status
-  - promptattempts/status
-  - providers/status
-  - publications/status
-  - repositorymonitors/status
-  - repositoryscans/status
-  - runtimepools/status
-  - runtimesessioncontrols/status
-  - skills/status
-  - substrateactorpools/status
-  - tasks/status
-  - tools/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - core.orka.ai
-  resources:
   - connectorproviders
   verbs:
   - get
   - list
   - patch
   - update
-  - watch
-- apiGroups:
-  - core.orka.ai
-  resources:
-  - outboundaccesspolicies
-  verbs:
-  - get
-  - list
   - watch
 - apiGroups:
   - core.orka.ai

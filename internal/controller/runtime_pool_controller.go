@@ -114,11 +114,20 @@ const (
 	runtimePoolProviderTokenFileEnv    = "ORKA_ACP_PROVIDER_TOKEN_FILE"
 	runtimePoolE2EPromptWriteAmbiguity = "ORKA_ACP_E2E_PROMPT_WRITE_AMBIGUITY_MARKER"
 
-	runtimePoolAuthVolume               = "pool-auth"
-	runtimePoolProviderCapabilityVolume = "provider-capability"
-	runtimePoolSessionsVolume           = "sessions"
-	runtimePoolTempVolume               = "tmp"
-	runtimePoolHomeVolume               = "home"
+	runtimePoolAuthVolume                  = "pool-auth"
+	runtimePoolProviderCapabilityVolume    = "provider-capability"
+	runtimePoolSessionsVolume              = "sessions"
+	runtimePoolTempVolume                  = "tmp"
+	runtimePoolHomeVolume                  = "home"
+	runtimePoolAgentPolicyGuarddVolume     = "agent-policy-guardd"
+	runtimePoolAgentPolicyAuthKeyVolume    = "agent-policy-auth-key"
+	runtimePoolAgentPolicyReceiptKeyVolume = "agent-policy-receipt-key"
+	runtimePoolAgentPolicyReceiptsVolume   = "agent-policy-receipts"
+	runtimePoolHostCgroupVolume            = "host-cgroup"
+	runtimePoolAgentPolicyGuarddSocketPath = "/run/orka/agent-policy/guardd.sock"
+	runtimePoolAgentPolicyAuthKeyPath      = "/run/orka/agent-policy/authorization-private.pem"
+	runtimePoolAgentPolicyReceiptKeyPath   = "/run/orka/agent-policy/receipt-public.pem"
+	runtimePoolAgentPolicyReceiptsPath     = "/var/lib/orka/agent-policy/receipts"
 
 	runtimePoolProviderCodex              = "codex"
 	runtimePoolProviderClaude             = "claude"
@@ -156,6 +165,7 @@ const (
 
 var (
 	digestPinnedImagePattern         = regexp.MustCompile(`^[^\s@]+@sha256:[a-f0-9]{64}$`)
+	agentPolicyDigestPattern         = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 	runtimePoolAuthSuffixPattern     = regexp.MustCompile(`auth-e[1-9][0-9]*(?:-[0-9a-f]{24})?$`)
 	runtimePoolProviderSuffixPattern = regexp.MustCompile(`provider-e[1-9][0-9]*-g[0-9a-f]{16}(?:-[0-9a-f]{24})?$`)
 )
@@ -165,6 +175,67 @@ var (
 type RuntimePoolProbeResult struct {
 	Capabilities harnessv2.CapabilitiesResponse
 	Status       harnessv2.StatusResponse
+}
+
+// RuntimePoolAgentPolicyConfig is the complete node-local guardd boundary for
+// managed runtime Pods. An all-empty value disables AgentPolicy. Any partial
+// value is rejected before the controller starts.
+type RuntimePoolAgentPolicyConfig struct {
+	GuarddSocketHostPath            string
+	AuthorizationIssuerID           string
+	AuthorizationPrivateKeyHostPath string
+	ReceiptPublicKeyHostPath        string
+	ReceiptDirectoryHostPath        string
+	GadgetDigest                    string
+	CgroupRoot                      string
+}
+
+func (c RuntimePoolAgentPolicyConfig) Enabled() bool {
+	return c != (RuntimePoolAgentPolicyConfig{})
+}
+
+func (c RuntimePoolAgentPolicyConfig) Validate() error {
+	if !c.Enabled() {
+		return nil
+	}
+	values := map[string]string{
+		"guardd socket host path":             c.GuarddSocketHostPath,
+		"authorization issuer ID":             c.AuthorizationIssuerID,
+		"authorization private key host path": c.AuthorizationPrivateKeyHostPath,
+		"receipt public key host path":        c.ReceiptPublicKeyHostPath,
+		"receipt directory host path":         c.ReceiptDirectoryHostPath,
+		"gadget digest":                       c.GadgetDigest,
+		"cgroup root":                         c.CgroupRoot,
+	}
+	for name, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("AgentPolicy %s is required when any AgentPolicy setting is configured", name)
+		}
+		if value != strings.TrimSpace(value) {
+			return fmt.Errorf("AgentPolicy %s must not have surrounding whitespace", name)
+		}
+	}
+	for name, value := range map[string]string{
+		"guardd socket host path":             c.GuarddSocketHostPath,
+		"authorization private key host path": c.AuthorizationPrivateKeyHostPath,
+		"receipt public key host path":        c.ReceiptPublicKeyHostPath,
+		"receipt directory host path":         c.ReceiptDirectoryHostPath,
+		"cgroup root":                         c.CgroupRoot,
+	} {
+		if !filepath.IsAbs(value) || filepath.Clean(value) != value {
+			return fmt.Errorf("AgentPolicy %s must be clean and absolute", name)
+		}
+	}
+	if c.CgroupRoot == "/sys/fs/cgroup" || !strings.HasPrefix(c.CgroupRoot, "/sys/fs/cgroup/") {
+		return fmt.Errorf("AgentPolicy cgroup root must be a child of /sys/fs/cgroup")
+	}
+	if len(c.AuthorizationIssuerID) > 128 || strings.ContainsAny(c.AuthorizationIssuerID, "/\\\x00") {
+		return fmt.Errorf("AgentPolicy authorization issuer ID is invalid")
+	}
+	if !agentPolicyDigestPattern.MatchString(c.GadgetDigest) {
+		return fmt.Errorf("AgentPolicy gadget digest must be sha256:<64 lowercase hex>")
+	}
+	return nil
 }
 
 // RuntimePoolSupervisorClient is the v2 control surface required by the
@@ -335,6 +406,8 @@ type RuntimePoolReconciler struct {
 	ControllerEpoch int64
 	// Epochs supplies the current durable leader epoch.
 	Epochs *ControllerEpochManager
+	// AgentPolicy configures the complete node-local guardd trust boundary.
+	AgentPolicy RuntimePoolAgentPolicyConfig
 	// EnablePDB protects a serving singleton from voluntary disruption.
 	EnablePDB bool
 	// EnableTelemetry projects non-secret trace exporter settings into supervisors.
@@ -2684,6 +2757,43 @@ func (r *RuntimePoolReconciler) runtimePoolPodTemplate(
 			},
 		},
 	}
+	if r.AgentPolicy.Enabled() {
+		runtime := &template.Spec.Containers[0]
+		// AgentPolicy activation creates an exact child cgroup and loads cgroup/LSM
+		// BPF programs before the stopped provider process is released. Privileged
+		// is intentionally scoped to this trusted supervisor container.
+		runtime.SecurityContext.Privileged = new(true)
+		runtime.SecurityContext.AllowPrivilegeEscalation = new(true)
+		runtime.SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined}
+		runtime.SecurityContext.Capabilities = nil
+		runtime.Env = append(runtime.Env,
+			corev1.EnvVar{Name: "ORKA_ACP_AGENT_POLICY_GUARDD_SOCKET", Value: runtimePoolAgentPolicyGuarddSocketPath},
+			corev1.EnvVar{Name: "ORKA_ACP_AGENT_POLICY_AUTHORIZATION_ISSUER_ID", Value: r.AgentPolicy.AuthorizationIssuerID},
+			corev1.EnvVar{Name: "ORKA_ACP_AGENT_POLICY_AUTHORIZATION_PRIVATE_KEY_FILE", Value: runtimePoolAgentPolicyAuthKeyPath},
+			corev1.EnvVar{Name: "ORKA_ACP_AGENT_POLICY_RECEIPT_PUBLIC_KEY_FILE", Value: runtimePoolAgentPolicyReceiptKeyPath},
+			corev1.EnvVar{Name: "ORKA_ACP_AGENT_POLICY_RECEIPT_DIRECTORY", Value: runtimePoolAgentPolicyReceiptsPath},
+			corev1.EnvVar{Name: "ORKA_ACP_AGENT_POLICY_GADGET_DIGEST", Value: r.AgentPolicy.GadgetDigest},
+			corev1.EnvVar{Name: "ORKA_ACP_AGENT_POLICY_NODE_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
+			corev1.EnvVar{Name: "ORKA_ACP_AGENT_POLICY_CGROUP_ROOT", Value: r.AgentPolicy.CgroupRoot},
+		)
+		runtime.VolumeMounts = append(runtime.VolumeMounts,
+			corev1.VolumeMount{Name: runtimePoolAgentPolicyGuarddVolume, MountPath: runtimePoolAgentPolicyGuarddSocketPath, ReadOnly: true},
+			corev1.VolumeMount{Name: runtimePoolAgentPolicyAuthKeyVolume, MountPath: runtimePoolAgentPolicyAuthKeyPath, ReadOnly: true},
+			corev1.VolumeMount{Name: runtimePoolAgentPolicyReceiptKeyVolume, MountPath: runtimePoolAgentPolicyReceiptKeyPath, ReadOnly: true},
+			corev1.VolumeMount{Name: runtimePoolAgentPolicyReceiptsVolume, MountPath: runtimePoolAgentPolicyReceiptsPath},
+			corev1.VolumeMount{Name: runtimePoolHostCgroupVolume, MountPath: "/sys/fs/cgroup"},
+		)
+		hostPathSocket := corev1.HostPathSocket
+		hostPathFile := corev1.HostPathFile
+		hostPathDirectory := corev1.HostPathDirectory
+		template.Spec.Volumes = append(template.Spec.Volumes,
+			corev1.Volume{Name: runtimePoolAgentPolicyGuarddVolume, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: r.AgentPolicy.GuarddSocketHostPath, Type: &hostPathSocket}}},
+			corev1.Volume{Name: runtimePoolAgentPolicyAuthKeyVolume, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: r.AgentPolicy.AuthorizationPrivateKeyHostPath, Type: &hostPathFile}}},
+			corev1.Volume{Name: runtimePoolAgentPolicyReceiptKeyVolume, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: r.AgentPolicy.ReceiptPublicKeyHostPath, Type: &hostPathFile}}},
+			corev1.Volume{Name: runtimePoolAgentPolicyReceiptsVolume, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: r.AgentPolicy.ReceiptDirectoryHostPath, Type: &hostPathDirectory}}},
+			corev1.Volume{Name: runtimePoolHostCgroupVolume, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/fs/cgroup", Type: &hostPathDirectory}}},
+		)
+	}
 	template.Spec.Containers[0].Env = append(template.Spec.Containers[0].Env, runtimePoolTelemetryEnv(r.EnableTelemetry, os.Getenv)...)
 	if marker := strings.TrimSpace(r.E2EPromptWriteAmbiguityMarker); marker != "" {
 		template.Spec.Containers[0].Env = append(template.Spec.Containers[0].Env, corev1.EnvVar{
@@ -4086,6 +4196,9 @@ func runtimePoolRequestForChild(_ context.Context, object client.Object) []recon
 
 // SetupWithManager sets up watches for RuntimePools and their cross-namespace children.
 func (r *RuntimePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := r.AgentPolicy.Validate(); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1alpha1.RuntimePool{}).
 		Watches(&appsv1.Deployment{}, handler.EnqueueRequestsFromMapFunc(runtimePoolRequestForChild)).

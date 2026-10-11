@@ -373,6 +373,7 @@ type CreateRuntimeSessionRequest struct {
 	WorkspaceArtifactAuthorization *ArtifactAuthorization     `json:"workspaceArtifactAuthorization,omitempty"`
 	Bootstrap                      *SessionBootstrap          `json:"bootstrap,omitempty"`
 	BootstrapArtifactAuthorization *ArtifactAuthorization     `json:"bootstrapArtifactAuthorization,omitempty"`
+	AgentPolicy                    *AgentPolicyActivation     `json:"agentPolicy,omitempty"`
 }
 
 func (r CreateRuntimeSessionRequest) ValidateAt(now time.Time) error {
@@ -434,6 +435,11 @@ func (r CreateRuntimeSessionRequest) ValidateAt(now time.Time) error {
 	} else if r.BootstrapArtifactAuthorization != nil {
 		return fmt.Errorf("bootstrap artifact authorization requires a transcript artifact")
 	}
+	if r.AgentPolicy != nil {
+		if err := r.AgentPolicy.Validate(); err != nil {
+			return fmt.Errorf("agent policy: %w", err)
+		}
+	}
 	return r.Metadata.ValidateDigest(r)
 }
 
@@ -449,6 +455,7 @@ type RuntimeSessionDescriptor struct {
 	WorkspaceBaseline    WorkspaceBaseline   `json:"workspaceBaseline"`
 	CreatedAt            time.Time           `json:"createdAt"`
 	LastTransitionAt     time.Time           `json:"lastTransitionAt"`
+	AgentPolicyReceipt   *AgentPolicyReceipt `json:"agentPolicyReceipt,omitempty"`
 }
 
 func (d RuntimeSessionDescriptor) Validate() error {
@@ -520,6 +527,18 @@ func (r CreateRuntimeSessionResponse) ValidateFor(request CreateRuntimeSessionRe
 		r.Session.Generation != request.Metadata.Fence.RuntimeSessionGeneration ||
 		r.Session.RuntimeProfileDigest != request.Metadata.Fence.RuntimeProfileDigest {
 		return fmt.Errorf("session create response identity does not match request")
+	}
+	if request.AgentPolicy == nil {
+		if r.Session.AgentPolicyReceipt != nil {
+			return fmt.Errorf("session returned unsolicited AgentPolicy receipt")
+		}
+	} else {
+		if r.Session.AgentPolicyReceipt == nil {
+			return fmt.Errorf("session omitted required AgentPolicy receipt")
+		}
+		if err := r.Session.AgentPolicyReceipt.ValidateFor(*request.AgentPolicy, string(request.Metadata.TaskUID), request.Metadata.TaskAttempt, string(request.RuntimeSessionID), r.Session.AgentPolicyReceipt.CgroupID); err != nil {
+			return fmt.Errorf("AgentPolicy receipt: %w", err)
+		}
 	}
 	return nil
 }

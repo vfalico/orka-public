@@ -1398,12 +1398,17 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 			errors.New("task-scoped RuntimeSession creation authorization expired before submission"),
 		)
 	}
+	policyActivation, err := resolveTaskPolicyActivation(ctx, d.APIReader, task)
+	if err != nil {
+		return fmt.Errorf("resolve task policy activation: %w", err)
+	}
 	createRequest := harnessv2.CreateRuntimeSessionRequest{
 		Protocol:         harnessv2.ProtocolVersion,
 		Metadata:         mutationMetadata(runtimeFence, task, createOperation, false, createExpiresAt),
 		RuntimeSessionID: harnessv2.RuntimeSessionID(runtimeSessionID(runtimeFence)),
 		Profile:          profile, AgentConfiguration: agentConfigurationRef, MCPConfiguration: mcpConfiguration,
 		Workspace: workspace, WorkspaceArtifactAuthorization: workspaceAuthorization,
+		AgentPolicy: policyActivation,
 	}
 	if err := sealMutation(&createRequest.Metadata.RequestDigest, createRequest); err != nil {
 		return err
@@ -1486,7 +1491,8 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 			}
 		}
 		created := false
-		if _, err := runtimeClient.CreateRuntimeSession(sessionCtx, createRequest); err != nil {
+		createResponse, err := runtimeClient.CreateRuntimeSession(sessionCtx, createRequest)
+		if err != nil {
 			if runtimeSessionRetirementRequired && runtimeSessionCreationMayHaveApplied(err) {
 				runtimeSessionCleanupPending = true
 			}
@@ -1627,8 +1633,39 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		if !created {
 			return fmt.Errorf("RuntimeSession creation was not reconciled")
 		}
+		// Arm retirement as soon as create/adoption proves the task-scoped
+		// RuntimeSession exists. Receipt validation and durable status persistence
+		// happen below; any failure there must retire the live session rather than
+		// leave a provider process whose activation evidence was not committed.
 		if runtimeSessionRetirementRequired {
 			runtimeSessionCleanupPending = true
+		}
+		if policyActivation != nil {
+			var receipt *harnessv2.AgentPolicyReceipt
+			if createResponse != nil {
+				receipt = createResponse.Session.AgentPolicyReceipt
+			} else {
+				_, observed, statusErr := runtimeSessionStatusForUID(sessionCtx, runtimeClient, runtimeFence.RuntimeSessionUID)
+				if statusErr != nil {
+					return fmt.Errorf("read adopted RuntimeSession policy receipt: %w", statusErr)
+				}
+				if observed == nil || observed.RuntimeSessionID != createRequest.RuntimeSessionID || observed.Generation != runtimeFence.RuntimeSessionGeneration {
+					return errors.New("adopted policy-bound RuntimeSession identity is unavailable")
+				}
+				receipt = observed.AgentPolicyReceipt
+			}
+			if receipt == nil {
+				return errors.New("policy-bound RuntimeSession returned no verified receipt")
+			}
+			if err := receipt.ValidateFor(*policyActivation, string(createRequest.Metadata.TaskUID), createRequest.Metadata.TaskAttempt, string(createRequest.RuntimeSessionID), receipt.CgroupID); err != nil {
+				return fmt.Errorf("verify reconciled AgentPolicy receipt: %w", err)
+			}
+			if err := d.patchExecution(ctx, task, func(status *corev1alpha1.TaskExecutionStatus) {
+				status.PolicyActivation = taskPolicyActivationStatus(receipt)
+				status.LastTransitionTime = nowMeta()
+			}); err != nil {
+				return fmt.Errorf("persist verified AgentPolicy activation: %w", err)
+			}
 		}
 		if sessionExecution != nil {
 			sessionExecution.Binding.RecreationRequired = false

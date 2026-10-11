@@ -13,11 +13,12 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-const execHelperProtocolVersion = "orka-acp-exec-v1"
+const execHelperProtocolVersion = "orka-acp-exec-v2"
 
 func newChildCommand(cfg ProcessConfig) (*exec.Cmd, error) {
 	helperCommand := strings.TrimSpace(cfg.ExecHelperCommand)
@@ -27,12 +28,13 @@ func newChildCommand(cfg ProcessConfig) (*exec.Cmd, error) {
 	if !filepath.IsAbs(helperCommand) {
 		return nil, fmt.Errorf("ACP exec helper command must be an absolute path")
 	}
-	helperArgs := make([]string, 0, 5+len(cfg.Args))
+	helperArgs := make([]string, 0, 6+len(cfg.Args))
 	helperArgs = append(helperArgs,
 		execHelperProtocolVersion,
 		strconv.Itoa(os.Getpid()),
 		strconv.Itoa(cfg.UID),
 		strconv.Itoa(cfg.GID),
+		strconv.FormatBool(cfg.ActivatePolicy != nil),
 		cfg.Command,
 	)
 	helperArgs = append(helperArgs, cfg.Args...)
@@ -55,20 +57,26 @@ func RunExecHelper(args, environment []string) error {
 	if err := applyCurrentProcessLimits(); err != nil {
 		return fmt.Errorf("apply child resource limits: %w", err)
 	}
+	if invocation.holdForPolicy {
+		if err := unix.Kill(os.Getpid(), unix.SIGSTOP); err != nil {
+			return fmt.Errorf("enter policy activation hold: %w", err)
+		}
+	}
 	argv := append([]string{invocation.command}, invocation.args...)
 	return unix.Exec(invocation.command, argv, environment)
 }
 
 type execHelperInvocation struct {
-	parentPID int
-	uid       int
-	gid       int
-	command   string
-	args      []string
+	parentPID     int
+	uid           int
+	gid           int
+	holdForPolicy bool
+	command       string
+	args          []string
 }
 
 func parseExecHelperInvocation(args []string) (execHelperInvocation, error) {
-	if len(args) < 5 || args[0] != execHelperProtocolVersion {
+	if len(args) < 6 || args[0] != execHelperProtocolVersion {
 		return execHelperInvocation{}, fmt.Errorf("invalid ACP exec helper invocation")
 	}
 	parentPID, err := strconv.Atoi(args[1])
@@ -83,16 +91,21 @@ func parseExecHelperInvocation(args []string) (execHelperInvocation, error) {
 	if err != nil || gid <= 0 {
 		return execHelperInvocation{}, fmt.Errorf("invalid ACP exec helper GID")
 	}
-	command := strings.TrimSpace(args[4])
+	holdForPolicy, err := strconv.ParseBool(args[4])
+	if err != nil {
+		return execHelperInvocation{}, fmt.Errorf("invalid ACP exec helper policy hold")
+	}
+	command := strings.TrimSpace(args[5])
 	if command == "" || !filepath.IsAbs(command) {
 		return execHelperInvocation{}, fmt.Errorf("invalid ACP exec helper adapter command")
 	}
 	return execHelperInvocation{
-		parentPID: parentPID,
-		uid:       uid,
-		gid:       gid,
-		command:   command,
-		args:      append([]string(nil), args[5:]...),
+		parentPID:     parentPID,
+		uid:           uid,
+		gid:           gid,
+		holdForPolicy: holdForPolicy,
+		command:       command,
+		args:          append([]string(nil), args[6:]...),
 	}, nil
 }
 
@@ -166,6 +179,29 @@ func childSysProcAttr(uid, gid int) *syscall.SysProcAttr {
 		attr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{}}
 	}
 	return attr
+}
+
+func signalProcess(pid int, signal os.Signal) error {
+	sig, ok := signal.(syscall.Signal)
+	if !ok {
+		return syscall.EINVAL
+	}
+	return syscall.Kill(pid, sig)
+}
+func waitForPolicyStop(pid int) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			return err
+		}
+		end := strings.LastIndex(string(data), ")")
+		if end > 0 && len(data) > end+2 && data[end+2] == 'T' {
+			return nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return fmt.Errorf("ACP exec helper did not enter stopped state")
 }
 
 func signalProcessGroup(pid int, signal os.Signal) error {

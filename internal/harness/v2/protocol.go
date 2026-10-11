@@ -259,6 +259,9 @@ type RuntimeSessionStatus struct {
 	ReservedForFinalization bool                `json:"reservedForFinalization"`
 	LiveDescendantCount     uint32              `json:"liveDescendantCount"`
 	LastTransitionAt        time.Time           `json:"lastTransitionAt"`
+	// AgentPolicyReceipt is the immutable receipt produced before provider exec.
+	// It is repeated in status so a controller can safely recover an ambiguous create.
+	AgentPolicyReceipt *AgentPolicyReceipt `json:"agentPolicyReceipt,omitempty"`
 }
 
 func (s RuntimeSessionStatus) Validate() error {

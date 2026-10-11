@@ -1128,6 +1128,117 @@ func TestRuntimePoolPodTemplateRevisionChangesForEveryRuntimeIdentityInput(t *te
 	}
 }
 
+func runtimePoolTestAgentPolicyConfig() RuntimePoolAgentPolicyConfig {
+	return RuntimePoolAgentPolicyConfig{
+		GuarddSocketHostPath:            "/run/ig-kmx-guardd/guardd.sock",
+		AuthorizationIssuerID:           "orka-production",
+		AuthorizationPrivateKeyHostPath: "/etc/ig-kmx-guardd/orka-authorization-private.pem",
+		ReceiptPublicKeyHostPath:        "/etc/ig-kmx-guardd/receipt-public.pem",
+		ReceiptDirectoryHostPath:        "/var/lib/ig-kmx-guardd/orka-receipts",
+		GadgetDigest:                    "sha256:" + strings.Repeat("7", 64),
+		CgroupRoot:                      "/sys/fs/cgroup/orka-agent-policy",
+	}
+}
+
+func TestRuntimePoolAgentPolicyConfigRejectsPartialConfiguration(t *testing.T) {
+	cfg := runtimePoolTestAgentPolicyConfig()
+	cfg.ReceiptPublicKeyHostPath = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "receipt public key host path is required") {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestRuntimePoolPodTemplateWiresNodeLocalGuarddBoundary(t *testing.T) {
+	pool := runtimePoolTestObject(1)
+	r := runtimePoolTestReconciler(t, runtimePoolTestScheme(t), nil, pool)
+	r.AgentPolicy = runtimePoolTestAgentPolicyConfig()
+	cfg, err := r.runtimePoolConfig(pool)
+	if err != nil {
+		t.Fatalf("runtimePoolConfig: %v", err)
+	}
+	template := r.runtimePoolPodTemplate(pool, cfg, map[string]string{runtimePoolKeyLabel: cfg.labels[runtimePoolKeyLabel]}, "auth", "provider")
+	if len(template.Spec.InitContainers) != 0 {
+		t.Fatalf("unexpected AgentPolicy init containers = %#v", template.Spec.InitContainers)
+	}
+	runtime := template.Spec.Containers[0]
+	if runtime.SecurityContext == nil || runtime.SecurityContext.Privileged == nil || !*runtime.SecurityContext.Privileged {
+		t.Fatal("AgentPolicy runtime is not privileged for BPF/cgroup attachment")
+	}
+	mounts := map[string]corev1.VolumeMount{}
+	for _, mount := range runtime.VolumeMounts {
+		mounts[mount.Name] = mount
+	}
+	for name, want := range map[string]struct {
+		path     string
+		readOnly bool
+	}{
+		runtimePoolAgentPolicyGuarddVolume:     {runtimePoolAgentPolicyGuarddSocketPath, true},
+		runtimePoolAgentPolicyAuthKeyVolume:    {runtimePoolAgentPolicyAuthKeyPath, true},
+		runtimePoolAgentPolicyReceiptKeyVolume: {runtimePoolAgentPolicyReceiptKeyPath, true},
+		runtimePoolAgentPolicyReceiptsVolume:   {runtimePoolAgentPolicyReceiptsPath, false},
+		runtimePoolHostCgroupVolume:            {"/sys/fs/cgroup", false},
+	} {
+		got, ok := mounts[name]
+		if !ok || got.MountPath != want.path || got.ReadOnly != want.readOnly {
+			t.Fatalf("mount %s = %#v, want path=%q readOnly=%v", name, got, want.path, want.readOnly)
+		}
+	}
+	hostPaths := map[string]string{}
+	for _, volume := range template.Spec.Volumes {
+		if volume.HostPath != nil {
+			hostPaths[volume.Name] = volume.HostPath.Path
+		}
+	}
+	for name, want := range map[string]string{
+		runtimePoolAgentPolicyGuarddVolume:     r.AgentPolicy.GuarddSocketHostPath,
+		runtimePoolAgentPolicyAuthKeyVolume:    r.AgentPolicy.AuthorizationPrivateKeyHostPath,
+		runtimePoolAgentPolicyReceiptKeyVolume: r.AgentPolicy.ReceiptPublicKeyHostPath,
+		runtimePoolAgentPolicyReceiptsVolume:   r.AgentPolicy.ReceiptDirectoryHostPath,
+		runtimePoolHostCgroupVolume:            "/sys/fs/cgroup",
+	} {
+		if hostPaths[name] != want {
+			t.Fatalf("host path %s = %q, want %q", name, hostPaths[name], want)
+		}
+	}
+	env := map[string]corev1.EnvVar{}
+	for _, item := range runtime.Env {
+		env[item.Name] = item
+	}
+	if env["ORKA_ACP_AGENT_POLICY_GUARDD_SOCKET"].Value != runtimePoolAgentPolicyGuarddSocketPath ||
+		env["ORKA_ACP_AGENT_POLICY_AUTHORIZATION_ISSUER_ID"].Value != r.AgentPolicy.AuthorizationIssuerID ||
+		env["ORKA_ACP_AGENT_POLICY_GADGET_DIGEST"].Value != r.AgentPolicy.GadgetDigest ||
+		env["ORKA_ACP_AGENT_POLICY_CGROUP_ROOT"].Value != r.AgentPolicy.CgroupRoot {
+		t.Fatalf("AgentPolicy environment = %#v", env)
+	}
+	nodeID := env["ORKA_ACP_AGENT_POLICY_NODE_ID"]
+	if nodeID.ValueFrom == nil || nodeID.ValueFrom.FieldRef == nil || nodeID.ValueFrom.FieldRef.FieldPath != "spec.nodeName" {
+		t.Fatalf("AgentPolicy node identity = %#v", nodeID)
+	}
+	baseRevision := template.Annotations[runtimePoolTemplateRevisionAnnotation]
+	r.AgentPolicy.GadgetDigest = "sha256:" + strings.Repeat("8", 64)
+	changed := r.runtimePoolPodTemplate(pool, cfg, map[string]string{runtimePoolKeyLabel: cfg.labels[runtimePoolKeyLabel]}, "auth", "provider")
+	if changed.Annotations[runtimePoolTemplateRevisionAnnotation] == baseRevision {
+		t.Fatal("AgentPolicy trust change did not update the runtime template revision")
+	}
+}
+
+func TestRuntimePoolPodTemplateWithoutAgentPolicyRemainsRestricted(t *testing.T) {
+	pool := runtimePoolTestObject(1)
+	r := runtimePoolTestReconciler(t, runtimePoolTestScheme(t), nil, pool)
+	cfg, err := r.runtimePoolConfig(pool)
+	if err != nil {
+		t.Fatalf("runtimePoolConfig: %v", err)
+	}
+	template := r.runtimePoolPodTemplate(pool, cfg, map[string]string{runtimePoolKeyLabel: cfg.labels[runtimePoolKeyLabel]}, "auth", "provider")
+	if len(template.Spec.InitContainers) != 0 {
+		t.Fatalf("unexpected init containers: %#v", template.Spec.InitContainers)
+	}
+	runtime := template.Spec.Containers[0]
+	if runtime.SecurityContext == nil || runtime.SecurityContext.Privileged == nil || *runtime.SecurityContext.Privileged {
+		t.Fatal("runtime without AgentPolicy adapter must remain unprivileged")
+	}
+}
+
 func TestRuntimePoolPodTemplateProjectsE2EPromptWriteAmbiguityMarker(t *testing.T) {
 	pool := runtimePoolTestObject(1)
 	r := runtimePoolTestReconciler(t, runtimePoolTestScheme(t), nil, pool)

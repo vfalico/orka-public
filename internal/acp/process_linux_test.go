@@ -3,7 +3,9 @@
 package acp
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -73,6 +75,56 @@ func testExecHelperCommand(t *testing.T) string {
 func cleanupTestExecHelper() {
 	if testExecHelperState.dir != "" {
 		_ = os.RemoveAll(testExecHelperState.dir)
+	}
+}
+
+func TestStartProcessActivatesPolicyWhileExecHelperIsHeld(t *testing.T) {
+	adapter := copyTestExecutableForChild(t)
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid == 0 {
+		uid, gid = 65534, 65534
+	}
+	var observedPID int
+	process, err := StartProcess(ProcessConfig{
+		Command:     adapter,
+		Args:        []string{"-test.run=^TestACPProcessLimitReporter$"},
+		Environment: []string{"GO_WANT_ACP_LIMIT_REPORTER=1", "ACP_EXPECT_UID=" + strconv.Itoa(uid), "ACP_EXPECT_GID=" + strconv.Itoa(gid)},
+		Paths:       SessionPaths{Workspace: "/tmp"}, UID: uid, GID: gid,
+		ExecHelperCommand: testExecHelperCommand(t),
+		ActivatePolicy: func(pid int) (io.Closer, error) {
+			observedPID = pid
+			status, readErr := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+			if readErr != nil {
+				return nil, readErr
+			}
+			if !bytes.Contains(status, []byte("State:\tT")) && !bytes.Contains(status, []byte("State:\tt")) {
+				return nil, fmt.Errorf("exec helper PID %d was not stopped during policy activation: %s", pid, status)
+			}
+			executable, readErr := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+			if readErr != nil {
+				return nil, readErr
+			}
+			if filepath.Clean(executable) != filepath.Clean(testExecHelperCommand(t)) {
+				return nil, fmt.Errorf("provider exec happened before policy activation: executable=%q", executable)
+			}
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observedPID != process.PID() {
+		t.Fatalf("activated PID=%d, process PID=%d", observedPID, process.PID())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := process.Wait(ctx); err != nil {
+		t.Fatalf("provider after activation: %v; diagnostics: %s", err, process.Diagnostics())
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if status, err := process.Stop(stopCtx, 100*time.Millisecond); err != nil || !status.Proven {
+		t.Fatalf("cleanup=%#v err=%v", status, err)
 	}
 }
 
@@ -152,7 +204,7 @@ func TestACPProcessLimitReporter(t *testing.T) {
 
 func TestParseExecHelperInvocationAllowsPIDOneParent(t *testing.T) {
 	invocation, err := parseExecHelperInvocation([]string{
-		execHelperProtocolVersion, "1", "1000", "1000", "/bin/true", "argument",
+		execHelperProtocolVersion, "1", "1000", "1000", "false", "/bin/true", "argument",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -163,16 +215,16 @@ func TestParseExecHelperInvocationAllowsPIDOneParent(t *testing.T) {
 }
 
 func TestParseExecHelperInvocationRejectsBypasses(t *testing.T) {
-	valid := []string{execHelperProtocolVersion, "100", "1000", "1000", "/bin/true"}
+	valid := []string{execHelperProtocolVersion, "100", "1000", "1000", "false", "/bin/true"}
 	tests := []struct {
 		name string
 		args []string
 	}{
 		{name: "wrong protocol", args: append([]string{"other"}, valid[1:]...)},
 		{name: "missing parent", args: valid[:1]},
-		{name: "root uid", args: []string{execHelperProtocolVersion, "100", "0", "1000", "/bin/true"}},
-		{name: "root gid", args: []string{execHelperProtocolVersion, "100", "1000", "0", "/bin/true"}},
-		{name: "relative command", args: []string{execHelperProtocolVersion, "100", "1000", "1000", "bin/true"}},
+		{name: "root uid", args: []string{execHelperProtocolVersion, "100", "0", "1000", "false", "/bin/true"}},
+		{name: "root gid", args: []string{execHelperProtocolVersion, "100", "1000", "0", "false", "/bin/true"}},
+		{name: "relative command", args: []string{execHelperProtocolVersion, "100", "1000", "1000", "false", "bin/true"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -743,4 +795,51 @@ func writeFakeProcStatus(t *testing.T, root string, pid int, contents string) {
 	if err := os.WriteFile(filepath.Join(directory, "status"), []byte(contents), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestStartProcessActivationFailureNeverExecsProviderAndReapsHeldChild(t *testing.T) {
+	adapter := copyTestExecutableForChild(t)
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid == 0 {
+		uid, gid = 65534, 65534
+	}
+	var heldPID int
+	process, err := StartProcess(ProcessConfig{
+		Command: adapter, Args: []string{"-test.run=^TestACPProcessLimitReporter$"},
+		Environment: []string{"GO_WANT_ACP_LIMIT_REPORTER=1", "ACP_EXPECT_UID=" + strconv.Itoa(uid), "ACP_EXPECT_GID=" + strconv.Itoa(gid)},
+		Paths:       SessionPaths{Workspace: "/tmp"}, UID: uid, GID: gid, ExecHelperCommand: testExecHelperCommand(t),
+		ActivatePolicy: func(pid int) (io.Closer, error) {
+			heldPID = pid
+			status, readErr := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+			if readErr != nil {
+				return nil, readErr
+			}
+			if !bytes.Contains(status, []byte("State:\tT")) && !bytes.Contains(status, []byte("State:\tt")) {
+				return nil, fmt.Errorf("child not held: %s", status)
+			}
+			executable, readErr := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+			if readErr != nil {
+				return nil, readErr
+			}
+			if filepath.Clean(executable) != filepath.Clean(testExecHelperCommand(t)) {
+				return nil, fmt.Errorf("provider exec happened before failed activation: %q", executable)
+			}
+			return nil, errors.New("simulated unavailable guardd")
+		},
+	})
+	if process != nil || err == nil || !strings.Contains(err.Error(), "simulated unavailable guardd") {
+		t.Fatalf("process=%v err=%v", process, err)
+	}
+	if heldPID <= 0 {
+		t.Fatal("activation callback did not observe held child")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, statErr := os.Stat(fmt.Sprintf("/proc/%d", heldPID))
+		if os.IsNotExist(statErr) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("failed activation child %d remains alive", heldPID)
 }

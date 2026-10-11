@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -121,6 +122,17 @@ type Config struct {
 	// recording the operation. The one-shot record survives runtime and
 	// supervisor recreation so live conformance exposes an accidental retry.
 	E2EPromptWriteAmbiguityMarker string
+
+	// Guardd owns privileged IG attachment lifetime; Orka speaks only the
+	// authenticated local seqpacket protocol and passes the exact cgroup FD.
+	AgentPolicyGuarddSocket                string
+	AgentPolicyAuthorizationIssuerID       string
+	AgentPolicyAuthorizationPrivateKeyFile string
+	AgentPolicyReceiptPublicKeyFile        string
+	AgentPolicyReceiptDirectory            string
+	AgentPolicyGadgetDigest                string
+	AgentPolicyNodeID                      string
+	AgentPolicyCgroupRoot                  string
 }
 
 func (c Config) Validate() error {
@@ -178,6 +190,26 @@ func (c Config) Validate() error {
 	}
 	if err := c.validatePromptWriteFault(); err != nil {
 		return err
+	}
+	guarddValues := []string{c.AgentPolicyGuarddSocket, c.AgentPolicyAuthorizationIssuerID, c.AgentPolicyAuthorizationPrivateKeyFile, c.AgentPolicyReceiptPublicKeyFile, c.AgentPolicyReceiptDirectory, c.AgentPolicyGadgetDigest, c.AgentPolicyNodeID, c.AgentPolicyCgroupRoot}
+	configured := 0
+	for _, value := range guarddValues {
+		if value != "" {
+			configured++
+		}
+	}
+	if configured != 0 && configured != len(guarddValues) {
+		return fmt.Errorf("all AgentPolicy guardd settings must be configured together")
+	}
+	if configured != 0 {
+		for name, value := range map[string]string{"socket": c.AgentPolicyGuarddSocket, "authorization private key": c.AgentPolicyAuthorizationPrivateKeyFile, "receipt public key": c.AgentPolicyReceiptPublicKeyFile, "receipt directory": c.AgentPolicyReceiptDirectory, "cgroup root": c.AgentPolicyCgroupRoot} {
+			if !filepath.IsAbs(value) || filepath.Clean(value) != value {
+				return fmt.Errorf("AgentPolicy guardd %s path must be clean and absolute", name)
+			}
+		}
+		if !isSHA256Digest(c.AgentPolicyGadgetDigest) || c.AgentPolicyNodeID == "" || strings.ContainsAny(c.AgentPolicyNodeID, "/\\\x00") || c.AgentPolicyAuthorizationIssuerID == "" || len(c.AgentPolicyAuthorizationIssuerID) > 128 || strings.ContainsAny(c.AgentPolicyAuthorizationIssuerID, "/\\\x00") {
+			return fmt.Errorf("AgentPolicy guardd gadget digest or node ID is invalid")
+		}
 	}
 	return nil
 }
@@ -266,4 +298,12 @@ func EmptyWorkspaceMaterializer() WorkspaceMaterializer {
 		}
 		return nil
 	})
+}
+
+func isSHA256Digest(value string) bool {
+	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	_, err := hex.DecodeString(value[7:])
+	return err == nil
 }

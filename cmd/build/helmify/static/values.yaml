@@ -93,6 +93,17 @@ controller:
     claudeImage: ghcr.io/orka-agents/orka/acp-claude-runtime:0.0.0-dev
     copilotImage: ghcr.io/orka-agents/orka/acp-copilot-runtime:0.0.0-dev
     opencodeImage: ghcr.io/orka-agents/orka/acp-opencode-runtime:0.0.0-dev
+    # Optional node-local guardd boundary. Leave every field empty to disable;
+    # setting any field requires the complete tuple.
+    agentPolicy:
+      guarddSocketHostPath: ""
+      authorizationIssuerID: ""
+      authorizationPrivateKeyHostPath: ""
+      receiptPublicKeyHostPath: ""
+      # Pre-create this root-owned directory with mode 0700 on every node.
+      receiptDirectoryHostPath: ""
+      gadgetDigest: ""
+      cgroupRoot: ""
     # Planned controller upgrades use a same-binary preStop child to call a
     # loopback-only coordinator. Keep terminationGracePeriodSeconds greater
     # than timeout and triggerTimeout so SIGTERM shutdown still has headroom.

@@ -76,3 +76,31 @@ func TestConfigValidateStableWorkspaceKeyRequiresDedicatedPool(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigValidateGuarddAuthorizationProtocolV1(t *testing.T) {
+	base, _ := newSessionIdentityTestConfig(t)
+	base.AgentPolicyGuarddSocket = "/run/ig-kmx-guardd/guardd.sock"
+	base.AgentPolicyAuthorizationIssuerID = "orka-production"
+	base.AgentPolicyAuthorizationPrivateKeyFile = "/etc/orka/guardd-authorization-private.pem"
+	base.AgentPolicyReceiptPublicKeyFile = "/etc/orka/guardd-receipt-public.pem"
+	base.AgentPolicyReceiptDirectory = "/var/lib/orka/guardd-receipts"
+	base.AgentPolicyGadgetDigest = "sha256:" + strings.Repeat("a", 64)
+	base.AgentPolicyNodeID = "node-1"
+	base.AgentPolicyCgroupRoot = "/sys/fs/cgroup/orka"
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid protocol-v1 guardd config: %v", err)
+	}
+	for name, mutate := range map[string]func(*Config){
+		"missing issuer":       func(c *Config) { c.AgentPolicyAuthorizationIssuerID = "" },
+		"issuer is not path":   func(c *Config) { c.AgentPolicyAuthorizationIssuerID = "/issuer" },
+		"relative private key": func(c *Config) { c.AgentPolicyAuthorizationPrivateKeyFile = "key.pem" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := base
+			mutate(&cfg)
+			if cfg.Validate() == nil {
+				t.Fatal("invalid guardd config accepted")
+			}
+		})
+	}
+}

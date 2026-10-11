@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // TaskType defines the type of task
@@ -126,9 +127,16 @@ type TaskTransaction struct {
 }
 
 // TaskSpec defines the desired state of Task
+type TaskPolicyBindingRef struct {
+	Name   string    `json:"name"`
+	UID    types.UID `json:"uid"`
+	Digest string    `json:"digest"`
+}
+
 // +kubebuilder:validation:XValidation:rule="has(self.requestedBy) == has(oldSelf.requestedBy) && (!has(self.requestedBy) || self.requestedBy == oldSelf.requestedBy)",message="requestedBy is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.transaction) == has(oldSelf.transaction) && (!has(self.transaction) || self.transaction == oldSelf.transaction)",message="transaction is immutable"
 // +kubebuilder:validation:XValidation:rule="self.type == oldSelf.type",message="type is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.policyBindingRef) == has(oldSelf.policyBindingRef) && (!has(self.policyBindingRef) || self.policyBindingRef == oldSelf.policyBindingRef)",message="policyBindingRef is immutable"
 // +kubebuilder:validation:XValidation:rule="(has(self.workspace) && has(self.workspace.intent) ? self.workspace.intent : (self.type == 'agent' ? 'read' : self.type)) == (has(oldSelf.workspace) && has(oldSelf.workspace.intent) ? oldSelf.workspace.intent : (oldSelf.type == 'agent' ? 'read' : oldSelf.type))",message="effective workspace intent is immutable"
 // +kubebuilder:validation:XValidation:rule="self.type != 'agent' || (has(self.prompt) == has(oldSelf.prompt) && (!has(self.prompt) || self.prompt == oldSelf.prompt))",message="agent prompt is immutable"
 // +kubebuilder:validation:XValidation:rule="self.type != 'agent' || (has(self.agentRef) == has(oldSelf.agentRef) && (!has(self.agentRef) || self.agentRef == oldSelf.agentRef))",message="agentRef is immutable for agent Tasks"
@@ -142,6 +150,9 @@ type TaskTransaction struct {
 // +kubebuilder:validation:XValidation:rule="self.type != 'container' || !has(self.workspace) || (!has(self.workspace.maxChangedFiles) && (!has(self.workspace.allowedPaths) || self.workspace.allowedPaths.size() == 0) && (!has(self.workspace.denyRepositoryControlPaths) || !self.workspace.denyRepositoryControlPaths) && (!has(self.workspace.rejectBinaryFiles) || !self.workspace.rejectBinaryFiles) && (!has(self.workspace.rejectSecretLikeContent) || !self.workspace.rejectSecretLikeContent))",message="container Tasks do not support clean-room workspace publication policies"
 // +kubebuilder:validation:XValidation:rule="self.type != 'container' || !has(self.workspace) || !has(self.workspace.pushBranch) || self.workspace.pushBranch.size() == 0 || !has(self.image) || self.image.size() == 0",message="custom-image container Tasks do not support workspace.pushBranch publication"
 type TaskSpec struct {
+	// PolicyBindingRef opts this Task into fail-closed policy admission.
+	// +optional
+	PolicyBindingRef *TaskPolicyBindingRef `json:"policyBindingRef,omitempty"`
 	// Type specifies the task type: "container" or "ai"
 	// +kubebuilder:validation:Required
 	Type TaskType `json:"type"`
