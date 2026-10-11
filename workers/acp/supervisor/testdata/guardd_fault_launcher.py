@@ -4,12 +4,23 @@ import json
 import os
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
 
 from ig_kmx_guardd.guardian_integration import FailSafeGuardService
 from ig_kmx_guardd.launcher import build_server, load
+
+
+def _start_ticks(pid: int) -> int:
+    with open(f"/proc/{pid}/stat", encoding="utf-8") as process_stat:
+        raw = process_stat.read()
+    close = raw.rfind(")")
+    fields = raw[close + 2 :].split()
+    if close < 0 or len(fields) <= 19:
+        raise RuntimeError(f"invalid process stat for {pid}")
+    return int(fields[19])
 
 
 class _FaultSentinel:
@@ -85,6 +96,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--control", required=True)
+    parser.add_argument("--coordinator-uid", required=True, type=int)
+    parser.add_argument("--coordinator-gid", required=True, type=int)
     args = parser.parse_args()
     FailSafeGuardService._event_consumer_sentinel = staticmethod(
         _faultable_event_consumer_sentinel
@@ -96,11 +109,19 @@ def main() -> int:
         os.unlink(args.control)
     control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     control.bind(args.control)
+    os.chown(args.control, args.coordinator_uid, args.coordinator_gid)
+    os.chmod(args.control, 0o600)
     control.listen(1)
     try:
         while True:
             connection, _ = control.accept()
             with connection:
+                peer_pid, peer_uid, peer_gid = struct.unpack(
+                    "3i",
+                    connection.getsockopt(
+                        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                    ),
+                )
                 command = connection.recv(64).decode().strip()
                 if len(server.service.workers) != 1:
                     raise RuntimeError("fault injection requires exactly one worker")
@@ -128,11 +149,29 @@ def main() -> int:
                 operation, separator, fault = command.partition(":")
                 if separator != ":" or operation not in {"prepare", "fire"}:
                     raise ValueError(f"unknown command: {command}")
+                if operation == "fire" and (
+                    peer_uid != args.coordinator_uid
+                    or peer_gid != args.coordinator_gid
+                ):
+                    raise PermissionError(
+                        f"fault fire peer {(peer_pid, peer_uid, peer_gid)} is not "
+                        f"the coordinator identity "
+                        f"{(args.coordinator_uid, args.coordinator_gid)}"
+                    )
                 evidence = {
                     "fault": fault,
                     "guardd_pid": os.getpid(),
+                    "guardd_start_ticks": _start_ticks(os.getpid()),
                     "worker_pid": worker.process.pid,
+                    "worker_start_ticks": _start_ticks(worker.process.pid),
                     "guardian_pid": guardian.process.pid,
+                    "guardian_start_ticks": _start_ticks(guardian.process.pid),
+                    "coordinator_pid": peer_pid if operation == "fire" else 0,
+                    "coordinator_start_ticks": (
+                        _start_ticks(peer_pid) if operation == "fire" else 0
+                    ),
+                    "coordinator_uid": peer_uid if operation == "fire" else 0,
+                    "coordinator_gid": peer_gid if operation == "fire" else 0,
                 }
                 if operation == "prepare":
                     connection.sendall((json.dumps(evidence, sort_keys=True) + "\n").encode())

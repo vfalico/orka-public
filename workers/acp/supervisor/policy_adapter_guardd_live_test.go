@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -55,6 +56,10 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 		t.Fatal("ORKA_LIVE_GUARDD_SOURCE, ORKA_LIVE_GUARDD_OCI, ORKA_LIVE_KMX_BIN, ORKA_LIVE_IG_BIN, and ORKA_LIVE_GADGET_DIGEST are required")
 	}
 	temp := t.TempDir()
+	identities := unusedLiveTestIdentities(t, 3)
+	liveUID := identities[0]
+	coordinatorUID := identities[1]
+	controlUID := identities[2]
 	socket := filepath.Join(temp, "guardd.sock")
 	state := filepath.Join(temp, "state.db")
 	authPrivate := filepath.Join(temp, "authorization-private.pem")
@@ -89,11 +94,36 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	daemonArgs := []string{launcher, "--config", configPath}
 	faultControl := filepath.Join(temp, "fault-control.sock")
 	guarddDeathStatus := faultControl + ".guardian-status"
+	faultCoordinator := ""
 	defer os.Remove(guarddDeathStatus)
 	if fault != "" {
+		faultAccessDir := filepath.Join("/tmp", "orka-guardd-fault-"+strconv.Itoa(os.Getpid()))
+		if err := os.Mkdir(faultAccessDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(faultAccessDir)
+		faultControl = filepath.Join(faultAccessDir, "fault-control.sock")
+		guarddDeathStatus = faultControl + ".guardian-status"
+		coordinatorSource := filepath.Join(
+			repositoryRootForLiveTest(t),
+			"workers", "acp", "supervisor", "testdata", "guardd_fault_coordinator.py",
+		)
+		coordinatorBytes, err := os.ReadFile(coordinatorSource)
+		if err != nil {
+			t.Fatal(err)
+		}
+		faultCoordinator = filepath.Join(faultAccessDir, "guardd_fault_coordinator.py")
+		if err := os.WriteFile(faultCoordinator, coordinatorBytes, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(faultCoordinator, 0o555); err != nil {
+			t.Fatal(err)
+		}
 		daemonArgs = []string{
 			filepath.Join(repositoryRootForLiveTest(t), "workers", "acp", "supervisor", "testdata", "guardd_fault_launcher.py"),
 			"--config", configPath, "--control", faultControl,
+			"--coordinator-uid", strconv.Itoa(coordinatorUID),
+			"--coordinator-gid", strconv.Itoa(coordinatorUID),
 		}
 	}
 	daemon := exec.Command("python3", daemonArgs...)
@@ -104,12 +134,28 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	if err := daemon.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		if daemon.Process != nil {
-			_ = syscall.Kill(-daemon.Process.Pid, syscall.SIGKILL)
-			_ = daemon.Wait()
+	daemonDone := make(chan error, 1)
+	go func() { daemonDone <- daemon.Wait() }()
+	daemonReaped := false
+	stopDaemon := func(processGroup bool) {
+		if daemonReaped {
+			return
 		}
-	}()
+		if processGroup {
+			_ = syscall.Kill(-daemon.Process.Pid, syscall.SIGKILL)
+		} else {
+			_ = daemon.Process.Kill()
+		}
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-daemonDone:
+			daemonReaped = true
+		case <-timer.C:
+			t.Errorf("guardd fixture process %d did not exit after SIGKILL", daemon.Process.Pid)
+		}
+	}
+	defer func() { stopDaemon(true) }()
 	waitForPath(t, socket, 10*time.Second)
 	if fault != "" {
 		waitForPath(t, faultControl, 10*time.Second)
@@ -163,9 +209,10 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	}
 	var activationReceipt *v2.AgentPolicyReceipt
 	var heldPID int
-	liveUID := unusedLiveTestIdentity(t)
+	var heldStartTicks uint64
 	process, err := acp.StartProcess(acp.ProcessConfig{Command: "/bin/sh", Args: []string{"-c", script}, Environment: []string{"PATH=/usr/bin:/bin"}, Paths: acp.SessionPaths{Workspace: "/tmp"}, UID: liveUID, GID: liveUID, ExecHelperCommand: helper, ActivatePolicy: func(pid int) (io.Closer, error) {
 		heldPID = pid
+		heldStartTicks = processStartTicks(t, pid)
 		stateBytes, readErr := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 		if readErr != nil {
 			return nil, readErr
@@ -241,13 +288,27 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	)
 	if fault != "" {
 		cgroupPath := filepath.Join(cgroupRoot, "session-live-"+token)
+		freezerPath := filepath.Join(cgroupPath, "cgroup.freeze")
+		controlHeartbeat := startLiveControlHeartbeat(t, cgroupRoot, token, controlUID)
+		defer controlHeartbeat.close(t)
+		if filepath.Dir(controlHeartbeat.cgroupPath) != filepath.Dir(cgroupPath) ||
+			controlHeartbeat.cgroupPath == cgroupPath ||
+			strings.HasPrefix(controlHeartbeat.cgroupPath+string(os.PathSeparator), cgroupPath+string(os.PathSeparator)) ||
+			strings.HasPrefix(cgroupPath+string(os.PathSeparator), controlHeartbeat.cgroupPath+string(os.PathSeparator)) {
+			t.Fatalf("control heartbeat cgroup is not a distinct sibling: control=%q guarded=%q", controlHeartbeat.cgroupPath, cgroupPath)
+		}
 		waitForPath(t, heartbeat, 5*time.Second)
 		beforeStart, beforeEnd := requireHeartbeatProgress(t, heartbeat, 2*time.Second)
+		controlBeforeStart, controlBeforeEnd := requireControlHeartbeatProgress(t, controlHeartbeat.path, 2*time.Second)
 		evidence := prepareGuarddFault(t, faultControl, fault)
-		if evidence.Fault != fault || evidence.GuarddPID != daemon.Process.Pid ||
+		if heldPID <= 1 || heldStartTicks == 0 ||
+			evidence.Fault != fault || evidence.GuarddPID != daemon.Process.Pid ||
 			evidence.WorkerPID <= 1 || evidence.GuardianPID <= 1 ||
 			evidence.WorkerPID == evidence.GuardianPID ||
-			evidence.WorkerPID == evidence.GuarddPID || evidence.GuardianPID == evidence.GuarddPID {
+			evidence.WorkerPID == evidence.GuarddPID || evidence.GuardianPID == evidence.GuarddPID ||
+			evidence.GuarddStartTicks == 0 || evidence.WorkerStartTicks == 0 || evidence.GuardianStartTicks == 0 ||
+			evidence.CoordinatorPID != 0 || evidence.CoordinatorStartTicks != 0 ||
+			evidence.CoordinatorUID != 0 || evidence.CoordinatorGID != 0 {
 			t.Fatalf("invalid fault evidence: %#v", evidence)
 		}
 		pidfds := make([]int, 0, 4)
@@ -263,32 +324,59 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 			if _, stopErr := process.Stop(ctx, time.Second); stopErr != nil {
 				t.Errorf("stop fault-test process: %v", stopErr)
 			}
-			if daemon.Process != nil {
-				_ = daemon.Process.Kill()
-				_ = daemon.Wait()
-			}
-			for _, fd := range pidfds {
+			stopDaemon(false)
+			for index, fd := range pidfds {
+				if !pidfdExited(fd, time.Now().Add(2*time.Second)) {
+					t.Errorf("%s did not exit during fault-test cleanup", []string{"held workload", "guardd", "IG worker", "guardian"}[index])
+				}
 				_ = unix.Close(fd)
 			}
+			waitForCgroupEmptyCleanup(t, cgroupPath, 2*time.Second)
 			if removeErr := os.Remove(cgroupPath); removeErr != nil && !os.IsNotExist(removeErr) {
 				t.Errorf("remove fault-test task cgroup: %v", removeErr)
 			}
-		}()
-		for _, pid := range []int{heldPID, evidence.GuarddPID, evidence.WorkerPID, evidence.GuardianPID} {
-			fd, openErr := unix.PidfdOpen(pid, 0)
-			if openErr != nil {
-				t.Fatalf("open pidfd for %d: %v", pid, openErr)
+			if _, statErr := os.Stat(cgroupPath); !os.IsNotExist(statErr) {
+				t.Errorf("fault-test task cgroup still exists after cleanup: %v", statErr)
 			}
-			pidfds = append(pidfds, fd)
+		}()
+		for _, identity := range []struct {
+			pid        int
+			startTicks uint64
+			name       string
+		}{
+			{heldPID, heldStartTicks, "held workload"},
+			{evidence.GuarddPID, evidence.GuarddStartTicks, "guardd"},
+			{evidence.WorkerPID, evidence.WorkerStartTicks, "IG worker"},
+			{evidence.GuardianPID, evidence.GuardianStartTicks, "guardian"},
+		} {
+			pidfds = append(pidfds, openPidfdForIdentity(t, identity.pid, identity.startTicks, identity.name))
 		}
 		for index, name := range []string{"held workload", "guardd", "IG worker", "guardian"} {
 			requirePidfdAlive(t, pidfds[index], name)
 		}
 		requireCgroupUnfrozen(t, cgroupPath)
+		trace := startGuardianFreezeTrace(t, temp, evidence.GuardianPID, evidence.GuardianStartTicks)
+		traceStopped := false
+		defer func() {
+			if !traceStopped {
+				trace.stop(t)
+			}
+		}()
+		trace.requireAttached(t)
 		started := time.Now()
+		startedNS := monotonicNowNS(t)
 		deadline := started.Add(6 * time.Second)
-		fired := fireGuarddFault(t, faultControl, fault, time.Until(deadline))
-		if fired != evidence {
+		coordinator := fireGuarddFaultAsCoordinator(
+			t, faultCoordinator, faultControl, freezerPath, fault, coordinatorUID, time.Until(deadline),
+		)
+		fired := coordinator.FaultEvidence
+		if fired.Fault != evidence.Fault ||
+			fired.GuarddPID != evidence.GuarddPID ||
+			fired.GuarddStartTicks != evidence.GuarddStartTicks ||
+			fired.WorkerPID != evidence.WorkerPID ||
+			fired.WorkerStartTicks != evidence.WorkerStartTicks ||
+			fired.GuardianPID != evidence.GuardianPID ||
+			fired.GuardianStartTicks != evidence.GuardianStartTicks {
 			t.Fatalf("fault identities changed between prepare and fire: prepare=%#v fire=%#v", evidence, fired)
 		}
 		if fault == "event_consumer" {
@@ -296,9 +384,15 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 		} else {
 			waitForCgroupFrozen(t, cgroupPath, deadline)
 		}
+		frozenNS := monotonicNowNS(t)
 		elapsed := time.Since(started)
 		frozenHeartbeat := requireHeartbeatStable(t, heartbeat, 500*time.Millisecond)
+		controlProof := requireControlHeartbeatContinuous(
+			t, controlHeartbeat.path, startedNS, frozenNS, 250*time.Millisecond,
+		)
 		guardianStatus := guarddGuardianStatus{}
+		terminal := guarddFaultTerminal{}
+		guarddAliveAfterControl := false
 		if fault != "guardd" && fault != "control" {
 			guardianStatus = readFaultStatus(t, faultControl)
 			expectedCause := "ig_worker_died"
@@ -327,9 +421,10 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 			waitForPidfdExit(t, pidfds[3], "guardian", time.Now().Add(2*time.Second))
 		} else {
 			requirePidfdAlive(t, pidfds[1], "guardd after control loss freeze")
+			guarddAliveAfterControl = true
 			waitForPidfdExit(t, pidfds[2], "IG worker", time.Now().Add(2*time.Second))
 			waitForPidfdExit(t, pidfds[3], "guardian", time.Now().Add(2*time.Second))
-			terminal := readFaultTerminal(t, faultControl)
+			terminal = readFaultTerminal(t, faultControl)
 			if terminal.GuardianReturncode == nil || *terminal.GuardianReturncode != 0 ||
 				terminal.WorkerReturncode == nil || *terminal.WorkerReturncode >= 0 {
 				t.Fatalf("unexpected control-loss terminal state: %#v", terminal)
@@ -339,11 +434,104 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 		if fault == "event_consumer" {
 			waitForPidfdExit(t, pidfds[2], "IG worker", time.Now().Add(2*time.Second))
 		}
+		trace.stop(t)
+		traceStopped = true
+		writerTID, freezeWrite := trace.requireExactFreezeWrite(t, freezerPath)
+		exportLiveFaultEvidence(t, os.Getenv("ORKA_LIVE_GUARDD_EVIDENCE_DIR"), liveFaultEvidenceExport{
+			Fault:                   fault,
+			FreezerPath:             freezerPath,
+			FreezeElapsedMS:         elapsed.Milliseconds(),
+			Prepared:                evidence,
+			Coordinator:             coordinator,
+			GuardianStatus:          guardianStatus,
+			Terminal:                terminal,
+			GuarddAliveAfterControl: guarddAliveAfterControl,
+			FreezeWriterTID:         writerTID,
+			FreezeWrite:             freezeWrite,
+			GuardedHeartbeatBefore:  beforeStart,
+			GuardedHeartbeatLast:    beforeEnd,
+			GuardedHeartbeatFrozen:  frozenHeartbeat,
+			ControlBefore:           controlBeforeStart,
+			ControlLast:             controlBeforeEnd,
+			ControlWindowFirst:      controlProof.first,
+			ControlWindowLast:       controlProof.last,
+			ControlMaxGapMS:         controlProof.maxGap.Milliseconds(),
+		}, filepath.Join(temp, "guardd.log"), receipts, persisted[0].Name(),
+			trace.prefix, heartbeat, controlHeartbeat.path)
 		t.Logf(
-			"fault=%s freeze_elapsed_ms=%d guardd_pid=%d worker_pid=%d guardian_pid=%d heartbeat_before=%d heartbeat_last=%d heartbeat_frozen=%d guardian_status=%v",
-			fault, elapsed.Milliseconds(), evidence.GuarddPID, evidence.WorkerPID,
-			evidence.GuardianPID, beforeStart, beforeEnd, frozenHeartbeat, guardianStatus,
+			"fault=%s freeze_elapsed_ms=%d guardd_pid=%d guardd_start=%d worker_pid=%d worker_start=%d guardian_pid=%d guardian_start=%d coordinator_pid=%d coordinator_start=%d coordinator_uid=%d freezer_denial_stage=%s freezer_errno=%d freeze_writer_tid=%d heartbeat_before=%d heartbeat_last=%d heartbeat_frozen=%d control_before=%d control_last=%d control_window_first=%d control_window_last=%d control_max_gap_ms=%d guardian_status=%v freeze_write=%q",
+			fault, elapsed.Milliseconds(), evidence.GuarddPID, evidence.GuarddStartTicks,
+			evidence.WorkerPID, evidence.WorkerStartTicks, evidence.GuardianPID,
+			evidence.GuardianStartTicks, coordinator.CoordinatorPID, coordinator.CoordinatorStartTicks,
+			coordinator.UID, coordinator.FreezerDenialStage, coordinator.FreezerErrno,
+			writerTID, beforeStart, beforeEnd, frozenHeartbeat,
+			controlBeforeStart, controlBeforeEnd, controlProof.first, controlProof.last,
+			controlProof.maxGap.Milliseconds(), guardianStatus, freezeWrite,
 		)
+	}
+}
+
+type liveFaultEvidenceExport struct {
+	Fault                   string                       `json:"fault"`
+	FreezerPath             string                       `json:"freezer_path"`
+	FreezeElapsedMS         int64                        `json:"freeze_elapsed_ms"`
+	Prepared                guarddFaultEvidence          `json:"prepared"`
+	Coordinator             guarddFaultCoordinatorResult `json:"coordinator"`
+	GuardianStatus          guarddGuardianStatus         `json:"guardian_status"`
+	Terminal                guarddFaultTerminal          `json:"terminal"`
+	GuarddAliveAfterControl bool                         `json:"guardd_alive_after_control"`
+	FreezeWriterTID         int                          `json:"freeze_writer_tid"`
+	FreezeWrite             string                       `json:"freeze_write"`
+	GuardedHeartbeatBefore  int                          `json:"guarded_heartbeat_before"`
+	GuardedHeartbeatLast    int                          `json:"guarded_heartbeat_last"`
+	GuardedHeartbeatFrozen  int                          `json:"guarded_heartbeat_frozen"`
+	ControlBefore           int64                        `json:"control_before"`
+	ControlLast             int64                        `json:"control_last"`
+	ControlWindowFirst      int64                        `json:"control_window_first"`
+	ControlWindowLast       int64                        `json:"control_window_last"`
+	ControlMaxGapMS         int64                        `json:"control_max_gap_ms"`
+}
+
+func exportLiveFaultEvidence(t *testing.T, directory string, summary liveFaultEvidenceExport, guarddLog, receipts, receiptName, tracePrefix, guardedHeartbeat, controlHeartbeat string) {
+	t.Helper()
+	if directory == "" {
+		return
+	}
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+		t.Fatalf("ORKA_LIVE_GUARDD_EVIDENCE_DIR must be clean and absolute")
+	}
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatalf("create live fault evidence directory: %v", err)
+	}
+	copyFile := func(source, name string) {
+		t.Helper()
+		data, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatalf("read live fault evidence %s: %v", source, err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, name), data, 0o600); err != nil {
+			t.Fatalf("write live fault evidence %s: %v", name, err)
+		}
+	}
+	copyFile(guarddLog, "guardd.log")
+	copyFile(filepath.Join(receipts, receiptName), receiptName)
+	copyFile(guardedHeartbeat, "guarded-heartbeat")
+	copyFile(controlHeartbeat, "control-heartbeat")
+	traceFiles, err := filepath.Glob(tracePrefix + ".*")
+	if err != nil || len(traceFiles) == 0 {
+		t.Fatalf("enumerate guardian trace files: files=%v err=%v", traceFiles, err)
+	}
+	sort.Strings(traceFiles)
+	for _, traceFile := range traceFiles {
+		copyFile(traceFile, filepath.Base(traceFile))
+	}
+	summaryBytes, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		t.Fatalf("encode live fault evidence summary: %v", err)
+	}
+	summaryBytes = append(summaryBytes, '\n')
+	if err := os.WriteFile(filepath.Join(directory, "summary.json"), summaryBytes, 0o600); err != nil {
+		t.Fatalf("write live fault evidence summary: %v", err)
 	}
 }
 
@@ -356,8 +544,11 @@ func repositoryRootForLiveTest(t *testing.T) string {
 	return repoRoot(t)
 }
 
-func unusedLiveTestIdentity(t *testing.T) int {
+func unusedLiveTestIdentities(t *testing.T, count int) []int {
 	t.Helper()
+	if count <= 0 {
+		t.Fatal("positive unused identity count is required")
+	}
 	used := map[int]bool{}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -395,20 +586,44 @@ func unusedLiveTestIdentity(t *testing.T) int {
 			t.Fatalf("process %s status has no Uid field", entry.Name())
 		}
 	}
-	for uid := 61000; uid < 62000; uid++ {
+	identities := make([]int, 0, count)
+	for uid := 61000; uid < 62000 && len(identities) < count; uid++ {
 		if !used[uid] {
-			return uid
+			identities = append(identities, uid)
 		}
 	}
-	t.Fatal("no unused live-test UID in [61000,62000)")
-	return 0
+	if len(identities) != count {
+		t.Fatalf("found %d unused live-test UIDs in [61000,62000), want %d", len(identities), count)
+	}
+	return identities
 }
 
 type guarddFaultEvidence struct {
-	Fault       string `json:"fault"`
-	GuarddPID   int    `json:"guardd_pid"`
-	WorkerPID   int    `json:"worker_pid"`
-	GuardianPID int    `json:"guardian_pid"`
+	Fault                 string `json:"fault"`
+	GuarddPID             int    `json:"guardd_pid"`
+	GuarddStartTicks      uint64 `json:"guardd_start_ticks"`
+	WorkerPID             int    `json:"worker_pid"`
+	WorkerStartTicks      uint64 `json:"worker_start_ticks"`
+	GuardianPID           int    `json:"guardian_pid"`
+	GuardianStartTicks    uint64 `json:"guardian_start_ticks"`
+	CoordinatorPID        int    `json:"coordinator_pid"`
+	CoordinatorStartTicks uint64 `json:"coordinator_start_ticks"`
+	CoordinatorUID        int    `json:"coordinator_uid"`
+	CoordinatorGID        int    `json:"coordinator_gid"`
+}
+
+type guarddFaultCoordinatorResult struct {
+	CoordinatorPID        int                 `json:"coordinator_pid"`
+	CoordinatorStartTicks uint64              `json:"coordinator_start_ticks"`
+	UID                   int                 `json:"uid"`
+	GID                   int                 `json:"gid"`
+	Groups                []int               `json:"groups"`
+	Capabilities          map[string]uint64   `json:"capabilities"`
+	FreezerPath           string              `json:"freezer_path"`
+	FreezerDenialStage    string              `json:"freezer_denial_stage"`
+	FreezerErrno          int                 `json:"freezer_errno"`
+	CgroupFDs             []map[string]any    `json:"cgroup_fds"`
+	FaultEvidence         guarddFaultEvidence `json:"fault_evidence"`
 }
 
 type guarddGuardianStatus struct {
@@ -455,14 +670,79 @@ func prepareGuarddFault(t *testing.T, socketPath, fault string) guarddFaultEvide
 	return evidence
 }
 
-func fireGuarddFault(t *testing.T, socketPath, fault string, timeout time.Duration) guarddFaultEvidence {
+func fireGuarddFaultAsCoordinator(t *testing.T, coordinator, socketPath, freezerPath, fault string, uid int, timeout time.Duration) guarddFaultCoordinatorResult {
 	t.Helper()
-	var evidence guarddFaultEvidence
-	faultControlRequest(t, socketPath, "fire:"+fault, timeout, &evidence)
-	if evidence.Fault != fault {
-		t.Fatalf("fault fire mismatch: %#v", evidence)
+	if timeout <= 0 {
+		t.Fatal("fault-control deadline elapsed")
 	}
-	return evidence
+	command := exec.Command(
+		"python3", coordinator,
+		"--control", socketPath,
+		"--freezer", freezerPath,
+		"--fault", fault,
+	)
+	command.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{
+			Uid:    uint32(uid),
+			Gid:    uint32(uid),
+			Groups: []uint32{},
+		},
+	}
+	type commandResult struct {
+		output []byte
+		err    error
+	}
+	done := make(chan commandResult, 1)
+	go func() {
+		output, err := command.CombinedOutput()
+		done <- commandResult{output: output, err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var result commandResult
+	select {
+	case result = <-done:
+	case <-timer.C:
+		if command.Process != nil {
+			_ = command.Process.Kill()
+		}
+		reapTimer := time.NewTimer(2 * time.Second)
+		defer reapTimer.Stop()
+		select {
+		case result = <-done:
+			t.Fatalf("unprivileged fault coordinator exceeded %s: %v: %s", timeout, result.err, result.output)
+		case <-reapTimer.C:
+			t.Fatalf("unprivileged fault coordinator exceeded %s and did not exit after SIGKILL", timeout)
+		}
+	}
+	if result.err != nil {
+		t.Fatalf("unprivileged fault coordinator: %v: %s", result.err, result.output)
+	}
+	var observed guarddFaultCoordinatorResult
+	if err := json.Unmarshal(result.output, &observed); err != nil {
+		t.Fatalf("decode unprivileged fault coordinator: %v: %s", err, result.output)
+	}
+	if observed.FaultEvidence.Fault != fault ||
+		observed.CoordinatorPID <= 1 ||
+		observed.CoordinatorStartTicks == 0 ||
+		observed.FaultEvidence.CoordinatorPID != observed.CoordinatorPID ||
+		observed.FaultEvidence.CoordinatorStartTicks != observed.CoordinatorStartTicks ||
+		observed.UID != uid || observed.GID != uid ||
+		observed.FaultEvidence.CoordinatorUID != uid ||
+		observed.FaultEvidence.CoordinatorGID != uid ||
+		len(observed.Groups) != 0 ||
+		len(observed.Capabilities) != 4 ||
+		observed.Capabilities["CapInh"] != 0 ||
+		observed.Capabilities["CapPrm"] != 0 ||
+		observed.Capabilities["CapEff"] != 0 ||
+		observed.Capabilities["CapAmb"] != 0 ||
+		observed.FreezerPath != freezerPath ||
+		(observed.FreezerDenialStage != "open" && observed.FreezerDenialStage != "write") ||
+		(observed.FreezerErrno != int(syscall.EACCES) && observed.FreezerErrno != int(syscall.EPERM)) ||
+		len(observed.CgroupFDs) != 0 {
+		t.Fatalf("invalid unprivileged fault evidence: %#v", observed)
+	}
+	return observed
 }
 
 func readFaultStatus(t *testing.T, socketPath string) guarddGuardianStatus {
@@ -524,29 +804,562 @@ func requireHeartbeatStable(t *testing.T, path string, duration time.Duration) i
 	return expected
 }
 
+type liveControlHeartbeat struct {
+	command    *exec.Cmd
+	done       chan error
+	pidfd      int
+	path       string
+	cgroupPath string
+}
+
+func startLiveControlHeartbeat(t *testing.T, cgroupRoot, token string, uid int) *liveControlHeartbeat {
+	t.Helper()
+	path := filepath.Join("/tmp", "orka-guardd-control-heartbeat-"+token)
+	cgroupPath := filepath.Join(cgroupRoot, "control-live-"+token)
+	if err := os.Mkdir(cgroupPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := fmt.Sprintf(
+		"import os,signal,time\nos.kill(os.getpid(), signal.SIGSTOP)\nwith open(%q, 'a', buffering=1) as out:\n while True:\n  out.write(str(time.monotonic_ns())+'\\n')\n  out.flush()\n  time.sleep(0.01)",
+		path,
+	)
+	command := exec.Command("python3", "-c", script)
+	command.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{
+			Uid:    uint32(uid),
+			Gid:    uint32(uid),
+			Groups: []uint32{},
+		},
+	}
+	if err := command.Start(); err != nil {
+		_ = os.Remove(cgroupPath)
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	pidfd := -1
+	ready := false
+	defer func() {
+		if ready {
+			return
+		}
+		_ = command.Process.Kill()
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+			t.Errorf("control heartbeat setup process did not exit")
+		}
+		if pidfd >= 0 {
+			_ = unix.Close(pidfd)
+		}
+		_ = os.Remove(path)
+		waitForCgroupEmptyCleanup(t, cgroupPath, 2*time.Second)
+		if err := os.Remove(cgroupPath); err != nil && !os.IsNotExist(err) {
+			t.Errorf("remove failed control heartbeat setup cgroup: %v", err)
+		}
+	}()
+	waitForProcessStopped(t, command.Process.Pid, 2*time.Second)
+	if err := os.WriteFile(
+		filepath.Join(cgroupPath, "cgroup.procs"),
+		[]byte(strconv.Itoa(command.Process.Pid)),
+		0o600,
+	); err != nil {
+		t.Fatalf("move control heartbeat into sibling cgroup: %v", err)
+	}
+	requireProcessInCgroup(t, command.Process.Pid, cgroupPath)
+	openedPidfd, err := unix.PidfdOpen(command.Process.Pid, 0)
+	if err != nil {
+		t.Fatalf("open control-heartbeat pidfd: %v", err)
+	}
+	pidfd = openedPidfd
+	if err := unix.PidfdSendSignal(pidfd, syscall.SIGCONT, nil, 0); err != nil {
+		t.Fatalf("release control heartbeat: %v", err)
+	}
+	waitForPath(t, path, 2*time.Second)
+	heartbeat := &liveControlHeartbeat{
+		command: command, done: done, pidfd: pidfd, path: path, cgroupPath: cgroupPath,
+	}
+	ready = true
+	return heartbeat
+}
+
+func (heartbeat *liveControlHeartbeat) close(t *testing.T) {
+	t.Helper()
+	if heartbeat == nil {
+		return
+	}
+	if heartbeat.pidfd >= 0 {
+		_ = unix.PidfdSendSignal(heartbeat.pidfd, syscall.SIGKILL, nil, 0)
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-heartbeat.done:
+	case <-timer.C:
+		t.Errorf("control heartbeat process did not exit")
+	}
+	if heartbeat.pidfd >= 0 {
+		if !pidfdExited(heartbeat.pidfd, time.Now().Add(2*time.Second)) {
+			t.Errorf("control heartbeat pidfd did not report exit")
+		}
+		_ = unix.Close(heartbeat.pidfd)
+		heartbeat.pidfd = -1
+	}
+	_ = os.Remove(heartbeat.path)
+	waitForCgroupEmptyCleanup(t, heartbeat.cgroupPath, 2*time.Second)
+	if err := os.Remove(heartbeat.cgroupPath); err != nil && !os.IsNotExist(err) {
+		t.Errorf("remove control heartbeat cgroup: %v", err)
+	}
+	if _, err := os.Stat(heartbeat.cgroupPath); !os.IsNotExist(err) {
+		t.Errorf("control heartbeat cgroup still exists after cleanup: %v", err)
+	}
+}
+
+func waitForProcessStopped(t *testing.T, pid int, maximum time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(maximum)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+		if err == nil && (bytes.Contains(raw, []byte("State:\tT")) || bytes.Contains(raw, []byte("State:\tt"))) {
+			return
+		}
+		<-ticker.C
+	}
+	t.Fatalf("process %d did not enter a stopped state", pid)
+}
+
+func requireProcessInCgroup(t *testing.T, pid int, cgroupPath string) {
+	t.Helper()
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative := strings.TrimPrefix(filepath.Clean(cgroupPath), "/sys/fs/cgroup")
+	if relative == "" {
+		relative = "/"
+	}
+	if strings.TrimSpace(string(raw)) != "0::"+relative {
+		t.Fatalf("process %d cgroup=%q, want %q", pid, raw, "0::"+relative)
+	}
+}
+
+func readControlHeartbeatSamples(t *testing.T, path string) []int64 {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Fields(string(raw))
+	samples := make([]int64, 0, len(lines))
+	for _, line := range lines {
+		sample, err := strconv.ParseInt(line, 10, 64)
+		if err != nil || sample <= 0 {
+			t.Fatalf("invalid control heartbeat sample %q: %v", line, err)
+		}
+		samples = append(samples, sample)
+	}
+	if len(samples) == 0 || !sort.SliceIsSorted(samples, func(i, j int) bool { return samples[i] < samples[j] }) {
+		t.Fatalf("control heartbeat samples are empty or non-monotonic: %v", samples)
+	}
+	return samples
+}
+
+func requireControlHeartbeatProgress(t *testing.T, path string, maximum time.Duration) (int64, int64) {
+	t.Helper()
+	startSamples := readControlHeartbeatSamples(t, path)
+	start := startSamples[len(startSamples)-1]
+	deadline := time.Now().Add(maximum)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		samples := readControlHeartbeatSamples(t, path)
+		current := samples[len(samples)-1]
+		if current > start {
+			return start, current
+		}
+		<-ticker.C
+	}
+	t.Fatalf("control heartbeat did not advance from %d within %s", start, maximum)
+	return 0, 0
+}
+
+type controlHeartbeatProof struct {
+	first  int64
+	last   int64
+	maxGap time.Duration
+}
+
+func requireControlHeartbeatContinuous(t *testing.T, path string, faultStartNS, frozenNS int64, maximumGap time.Duration) controlHeartbeatProof {
+	t.Helper()
+	if faultStartNS <= 0 || frozenNS < faultStartNS || maximumGap <= 0 {
+		t.Fatalf("invalid control heartbeat window: start=%d frozen=%d max_gap=%s", faultStartNS, frozenNS, maximumGap)
+	}
+	target := frozenNS + int64(300*time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var samples []int64
+	for time.Now().Before(deadline) {
+		samples = readControlHeartbeatSamples(t, path)
+		if samples[len(samples)-1] >= target {
+			break
+		}
+		<-ticker.C
+	}
+	if len(samples) == 0 || samples[len(samples)-1] < target {
+		t.Fatalf("control heartbeat did not continue after guarded freeze: last=%v target=%d", samples, target)
+	}
+	startIndex := -1
+	endIndex := -1
+	for index, sample := range samples {
+		if sample <= faultStartNS {
+			startIndex = index
+		}
+		if endIndex < 0 && sample >= target {
+			endIndex = index
+		}
+	}
+	if startIndex < 0 || endIndex <= startIndex {
+		t.Fatalf("control heartbeat does not span fault/freeze window: start=%d frozen=%d samples=%v", faultStartNS, frozenNS, samples)
+	}
+	var maxGap time.Duration
+	for index := startIndex + 1; index <= endIndex; index++ {
+		gap := time.Duration(samples[index] - samples[index-1])
+		if gap > maxGap {
+			maxGap = gap
+		}
+		if gap > maximumGap {
+			t.Fatalf("control heartbeat gap %s exceeds %s between %d and %d", gap, maximumGap, samples[index-1], samples[index])
+		}
+	}
+	return controlHeartbeatProof{
+		first: samples[startIndex], last: samples[endIndex], maxGap: maxGap,
+	}
+}
+
+func monotonicNowNS(t *testing.T) int64 {
+	t.Helper()
+	var now unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &now); err != nil {
+		t.Fatal(err)
+	}
+	return now.Nano()
+}
+
+type guardianFreezeTrace struct {
+	command       *exec.Cmd
+	done          chan error
+	prefix        string
+	tracerPID     int
+	guardianPID   int
+	guardianStart uint64
+	threadIDs     map[int]bool
+}
+
+func startGuardianFreezeTrace(t *testing.T, temp string, guardianPID int, expectedStart uint64) *guardianFreezeTrace {
+	t.Helper()
+	if _, err := exec.LookPath("strace"); err != nil {
+		t.Fatalf("strace is required for guardian freezer attribution: %v", err)
+	}
+	start := processStartTicks(t, guardianPID)
+	if start != expectedStart {
+		t.Fatalf("guardian identity changed before tracing: pid=%d start=%d want=%d", guardianPID, start, expectedStart)
+	}
+	prefix := filepath.Join(temp, "guardian-freeze.trace")
+	command := exec.Command(
+		"strace", "-ff", "-yy",
+		"-e", "trace=openat,openat2,write",
+		"-o", prefix,
+		"-p", strconv.Itoa(guardianPID),
+	)
+	var diagnostics bytes.Buffer
+	command.Stderr = &diagnostics
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	trace := &guardianFreezeTrace{
+		command: command, done: make(chan error, 1), prefix: prefix,
+		tracerPID: command.Process.Pid, guardianPID: guardianPID,
+		guardianStart: start, threadIDs: map[int]bool{},
+	}
+	go func() { trace.done <- command.Wait() }()
+	attached := false
+	defer func() {
+		if !attached {
+			trace.stop(t)
+		}
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-trace.done:
+			trace.command = nil
+			t.Fatalf("strace exited before attachment: %v: %s", err, diagnostics.String())
+		default:
+		}
+		if trace.tryRequireAttached() {
+			attached = true
+			return trace
+		}
+		<-ticker.C
+	}
+	t.Fatalf("strace %d did not attach to guardian %d and all threads: %s", trace.tracerPID, guardianPID, diagnostics.String())
+	return nil
+}
+
+func (trace *guardianFreezeTrace) tryRequireAttached() bool {
+	if processStartTicksRaw(trace.guardianPID) != trace.guardianStart {
+		return false
+	}
+	threads, err := processThreadIDs(trace.guardianPID)
+	if err != nil || len(threads) == 0 {
+		return false
+	}
+	for _, tid := range threads {
+		tracerPID, err := processTracerPID(tid)
+		if err != nil || tracerPID != trace.tracerPID {
+			return false
+		}
+	}
+	for _, tid := range threads {
+		trace.threadIDs[tid] = true
+	}
+	return true
+}
+
+func (trace *guardianFreezeTrace) requireAttached(t *testing.T) {
+	t.Helper()
+	if !trace.tryRequireAttached() {
+		t.Fatalf("strace %d is not attached to guardian %d and every current thread", trace.tracerPID, trace.guardianPID)
+	}
+}
+
+func (trace *guardianFreezeTrace) stop(t *testing.T) {
+	t.Helper()
+	if trace == nil || trace.command == nil {
+		return
+	}
+	select {
+	case <-trace.done:
+		trace.command = nil
+		return
+	default:
+	}
+	_ = trace.command.Process.Signal(os.Interrupt)
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-trace.done:
+	case <-timer.C:
+		_ = trace.command.Process.Kill()
+		killTimer := time.NewTimer(2 * time.Second)
+		defer killTimer.Stop()
+		select {
+		case <-trace.done:
+			t.Errorf("strace required SIGKILL after interrupt")
+		case <-killTimer.C:
+			t.Errorf("strace did not exit after SIGKILL")
+		}
+	}
+	trace.command = nil
+}
+
+func (trace *guardianFreezeTrace) requireExactFreezeWrite(t *testing.T, freezerPath string) (int, string) {
+	t.Helper()
+	files, err := filepath.Glob(trace.prefix + "*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("guardian trace produced no files")
+	}
+	type match struct {
+		tid  int
+		line string
+	}
+	var matches []match
+	for _, path := range files {
+		suffix := strings.TrimPrefix(path, trace.prefix+".")
+		tid, err := strconv.Atoi(suffix)
+		if err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.Contains(trimmed, "write(") &&
+				strings.Contains(trimmed, "<"+freezerPath+">") &&
+				strings.Contains(trimmed, `"1\n", 2)`) &&
+				strings.HasSuffix(trimmed, "= 2") {
+				matches = append(matches, match{tid: tid, line: trimmed})
+			}
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("guardian exact freezer writes=%#v, want exactly one", matches)
+	}
+	if !trace.threadIDs[matches[0].tid] {
+		t.Fatalf("freezer writer TID %d was not an attached guardian thread: %#v", matches[0].tid, trace.threadIDs)
+	}
+	return matches[0].tid, matches[0].line
+}
+
+func processStartTicks(t *testing.T, pid int) uint64 {
+	t.Helper()
+	start := processStartTicksRaw(pid)
+	if start == 0 {
+		t.Fatalf("read process %d start time", pid)
+	}
+	return start
+}
+
+func processStartTicksRaw(pid int) uint64 {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	closeParen := bytes.LastIndexByte(raw, ')')
+	if closeParen < 0 || closeParen+2 >= len(raw) {
+		return 0
+	}
+	fields := strings.Fields(string(raw[closeParen+2:]))
+	if len(fields) <= 19 {
+		return 0
+	}
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return start
+}
+
+func processThreadIDs(pid int) ([]int, error) {
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
+	if err != nil {
+		return nil, err
+	}
+	threads := make([]int, 0, len(entries))
+	for _, entry := range entries {
+		tid, err := strconv.Atoi(entry.Name())
+		if err == nil {
+			threads = append(threads, tid)
+		}
+	}
+	sort.Ints(threads)
+	return threads, nil
+}
+
+func processTracerPID(tid int) (int, error) {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", tid))
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "TracerPid:") {
+			fields := strings.Fields(line)
+			if len(fields) != 2 {
+				return 0, fmt.Errorf("malformed TracerPid line %q", line)
+			}
+			return strconv.Atoi(fields[1])
+		}
+	}
+	return 0, errors.New("process status has no TracerPid")
+}
+
+func openPidfdForIdentity(t *testing.T, pid int, expectedStart uint64, name string) int {
+	t.Helper()
+	before := processStartTicks(t, pid)
+	if before != expectedStart {
+		t.Fatalf("%s identity changed before pidfd open: pid=%d start=%d want=%d", name, pid, before, expectedStart)
+	}
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		t.Fatalf("open %s pidfd for %d: %v", name, pid, err)
+	}
+	after := processStartTicksRaw(pid)
+	if after != expectedStart {
+		_ = unix.Close(pidfd)
+		t.Fatalf("%s identity changed across pidfd open: pid=%d start=%d want=%d", name, pid, after, expectedStart)
+	}
+	return pidfd
+}
+
 func requirePidfdAlive(t *testing.T, pidfd int, name string) {
 	t.Helper()
-	pollfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
-	if _, err := unix.Poll(pollfds, 0); err != nil {
+	exited, err := pollPidfd(pidfd, 0)
+	if err != nil {
 		t.Fatalf("poll %s pidfd: %v", name, err)
 	}
-	if pollfds[0].Revents != 0 {
-		t.Fatalf("%s exited before fault injection: pidfd events=%#x", name, pollfds[0].Revents)
+	if exited {
+		t.Fatalf("%s exited before fault injection", name)
 	}
+}
+
+func pollPidfd(pidfd, timeoutMS int) (bool, error) {
+	for attempts := 0; attempts < 16; attempts++ {
+		pollfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+		_, err := unix.Poll(pollfds, timeoutMS)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return pollfds[0].Revents != 0, err
+	}
+	return false, errors.New("pidfd poll repeatedly interrupted")
+}
+
+func pidfdExited(pidfd int, deadline time.Time) bool {
+	for time.Now().Before(deadline) {
+		exited, err := pollPidfd(pidfd, 10)
+		if err != nil {
+			return false
+		}
+		if exited {
+			return true
+		}
+	}
+	return false
 }
 
 func waitForPidfdExit(t *testing.T, pidfd int, name string, deadline time.Time) {
 	t.Helper()
-	pollfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
-	for time.Now().Before(deadline) {
-		if _, err := unix.Poll(pollfds, 10); err != nil {
-			t.Fatalf("poll %s pidfd: %v", name, err)
-		}
-		if pollfds[0].Revents != 0 {
-			return
-		}
+	if pidfdExited(pidfd, deadline) {
+		return
 	}
 	t.Fatalf("%s did not exit before deadline", name)
+}
+
+func waitForCgroupEmptyCleanup(t *testing.T, cgroupPath string, maximum time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(maximum)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var last []byte
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.events"))
+		if os.IsNotExist(err) {
+			return
+		}
+		if err == nil {
+			last = raw
+			fields := strings.Fields(string(raw))
+			for index := 0; index+1 < len(fields); index += 2 {
+				if fields[index] == "populated" && fields[index+1] == "0" {
+					return
+				}
+			}
+		}
+		<-ticker.C
+	}
+	t.Errorf("cgroup %q did not become empty during cleanup: %q", cgroupPath, last)
 }
 
 func requireCgroupUnfrozen(t *testing.T, cgroupPath string) {
