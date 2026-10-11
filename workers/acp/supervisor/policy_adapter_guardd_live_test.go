@@ -27,6 +27,7 @@ import (
 
 	core "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/acp"
+	"github.com/orka-agents/orka/internal/guarddclient"
 	"github.com/orka-agents/orka/internal/harness/v2"
 	policyresolver "github.com/orka-agents/orka/internal/policy"
 	"golang.org/x/sys/unix"
@@ -48,9 +49,13 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	igBinary := os.Getenv("ORKA_LIVE_IG_BIN")
 	gadgetDigest := os.Getenv("ORKA_LIVE_GADGET_DIGEST")
 	fault := os.Getenv("ORKA_LIVE_GUARDD_FAULT")
+	executableHeadline := os.Getenv("ORKA_LIVE_GUARDD_EXEC_HEADLINE") == "1"
 	if fault != "" && fault != "worker" && fault != "event_consumer" &&
 		fault != "guardd" && fault != "control" {
 		t.Fatalf("unsupported ORKA_LIVE_GUARDD_FAULT %q", fault)
+	}
+	if executableHeadline && fault != "" {
+		t.Fatal("executable headline and fault injection are separate live tests")
 	}
 	if guarddSource == "" || oci == "" || kmxBinary == "" || igBinary == "" || gadgetDigest == "" {
 		t.Fatal("ORKA_LIVE_GUARDD_SOURCE, ORKA_LIVE_GUARDD_OCI, ORKA_LIVE_KMX_BIN, ORKA_LIVE_IG_BIN, and ORKA_LIVE_GADGET_DIGEST are required")
@@ -189,10 +194,47 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	deny := filepath.Join("/tmp", "orka-guardd-deny-"+token)
 	allow := filepath.Join("/tmp", "orka-guardd-allow-"+token)
 	status := filepath.Join("/tmp", "orka-guardd-status-"+token)
+	headlineMarker := filepath.Join("/tmp", "orka-guardd-exec-marker-"+token)
 	defer os.Remove(deny)
 	defer os.Remove(allow)
 	defer os.Remove(status)
-	policy := renderKMXActivation(t, kmxBinary, temp, deny)
+	defer os.Remove(headlineMarker)
+	policy := v2.AgentPolicyActivation{}
+	if executableHeadline {
+		source := filepath.Join(temp, "headline-helper.go")
+		if err := os.WriteFile(source, []byte(`package main
+
+import (
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	if err := os.WriteFile(os.Getenv("HEADLINE_MARKER"), []byte(filepath.Base(os.Args[0])+"\n"), 0o600); err != nil {
+		panic(err)
+	}
+}
+`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		buildHeadline := exec.Command("go", "build", "-buildvcs=false", "-trimpath", "-o", deny, source)
+		buildHeadline.Env = append(os.Environ(), "CGO_ENABLED=0")
+		if output, err := buildHeadline.CombinedOutput(); err != nil {
+			t.Fatalf("build executable headline helper: %v: %s", err, output)
+		}
+		helperBytes, err := os.ReadFile(deny)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(allow, helperBytes, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(deny, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		policy = renderKMXActivation(t, kmxBinary, temp, deny)
+	}
 	metadata := v2.MutationMetadata{TaskUID: v2.TaskUID("task-live"), TaskAttempt: 1}
 	guarddCfg := guarddRuntimeConfig{SocketPath: socket, AuthorizationIssuerID: "orka-production", AuthorizationPrivateKeyFile: authPrivate, ReceiptPublicKeyFile: public, ReceiptDirectory: receipts, GadgetDigest: gadgetDigest, NodeID: "node-orka-live", CgroupRoot: cgroupRoot}
 	heartbeat := filepath.Join("/tmp", "orka-guardd-heartbeat-"+token)
@@ -200,6 +242,14 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	defer os.Remove(heartbeat)
 	defer os.Remove(heartbeatTemp)
 	script := fmt.Sprintf("printf denied > %q; d=$?; printf allowed > %q; a=$?; printf '%%s %%s' \"$d\" \"$a\" > %q; sleep 300", deny, allow, status)
+	if executableHeadline {
+		script = fmt.Sprintf(
+			"HEADLINE_MARKER=%s %s; d=$?; HEADLINE_MARKER=%s %s; a=$?; printf '%%s %%s' \"$d\" \"$a\" > %s; sleep 300",
+			liveTestShellQuote(headlineMarker), liveTestShellQuote(deny),
+			liveTestShellQuote(headlineMarker), liveTestShellQuote(allow),
+			liveTestShellQuote(status),
+		)
+	}
 	if fault != "" {
 		script = fmt.Sprintf(
 			"printf denied > %s; d=$?; printf allowed > %s; a=$?; printf '%%s %%s' \"$d\" \"$a\" > %s; exec python3 -c %s",
@@ -208,6 +258,7 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 		)
 	}
 	var activationReceipt *v2.AgentPolicyReceipt
+	var rawGuarddReceipt *guarddclient.Receipt
 	var heldPID int
 	var heldStartTicks uint64
 	process, err := acp.StartProcess(acp.ProcessConfig{Command: "/bin/sh", Args: []string{"-c", script}, Environment: []string{"PATH=/usr/bin:/bin"}, Paths: acp.SessionPaths{Workspace: "/tmp"}, UID: liveUID, GID: liveUID, ExecHelperCommand: helper, ActivatePolicy: func(pid int) (io.Closer, error) {
@@ -220,7 +271,22 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 		if !strings.Contains(string(stateBytes), "State:\tT") && !strings.Contains(string(stateBytes), "State:\tt") {
 			return nil, fmt.Errorf("exec helper is not held: %s", stateBytes)
 		}
-		lifetime, receipt, activateErr := activateAgentPolicy(context.Background(), guarddCfg, policy, metadata, "session-live-"+token, pid)
+		if _, statErr := os.Stat(status); !os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("held workload produced status before release: %v", statErr)
+		}
+		if _, statErr := os.Stat(headlineMarker); !os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("held workload produced side effect before release: %v", statErr)
+		}
+		if executableHeadline {
+			lifetime, receipt, activateErr := activateExecutableHeadlinePolicy(
+				context.Background(), guarddCfg, metadata, "session-live-"+token, pid, deny,
+			)
+			rawGuarddReceipt = receipt
+			return lifetime, activateErr
+		}
+		lifetime, receipt, activateErr := activateAgentPolicy(
+			context.Background(), guarddCfg, policy, metadata, "session-live-"+token, pid,
+		)
 		activationReceipt = receipt
 		return lifetime, activateErr
 	}})
@@ -239,8 +305,62 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	fields := strings.Fields(string(result))
-	if len(fields) != 2 || fields[0] == "0" || fields[1] != "0" {
-		t.Fatalf("deny/allow exits=%q", result)
+	if len(fields) != 2 || fields[0] != "126" || fields[1] != "0" {
+		logBytes, _ := os.ReadFile(filepath.Join(temp, "guardd.log"))
+		t.Fatalf("deny/allow exits=%q\nverified receipt=%#v\nguardd log:\n%s", result, rawGuarddReceipt, logBytes)
+	}
+	if executableHeadline {
+		marker, readErr := os.ReadFile(headlineMarker)
+		if readErr != nil || string(marker) != filepath.Base(allow)+"\n" {
+			t.Fatalf("executable headline marker=%q err=%v", marker, readErr)
+		}
+		if rawGuarddReceipt == nil || len(rawGuarddReceipt.Signed) == 0 ||
+			len(rawGuarddReceipt.Attachments) != 1 ||
+			rawGuarddReceipt.Attachments[0].ProgramName != "agentpolicy_exec" ||
+			rawGuarddReceipt.Attachments[0].AttachType != "lsm/bprm_check_security" {
+			t.Fatalf("verified executable guardd receipt = %#v", rawGuarddReceipt)
+		}
+		persisted, readDirErr := os.ReadDir(receipts)
+		if readDirErr != nil {
+			t.Fatal(readDirErr)
+		}
+		if len(persisted) != 1 || persisted[0].IsDir() {
+			t.Fatalf("persisted executable receipt entries = %#v", persisted)
+		}
+		persistedReceipt, readErr := os.ReadFile(filepath.Join(receipts, persisted[0].Name()))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !bytes.Equal(persistedReceipt, rawGuarddReceipt.Signed) {
+			t.Fatal("persisted executable receipt does not match verified receipt")
+		}
+		exportExecutableHeadlineEvidence(
+			t, os.Getenv("ORKA_LIVE_GUARDD_EVIDENCE_DIR"), persisted[0].Name(),
+			persistedReceipt, map[string]any{
+				"headline":       "held-executable",
+				"held_start":     true,
+				"denied_path":    deny,
+				"allowed_path":   allow,
+				"deny_exit":      fields[0],
+				"allow_exit":     fields[1],
+				"marker":         strings.TrimSpace(string(marker)),
+				"program_name":   rawGuarddReceipt.Attachments[0].ProgramName,
+				"attach_type":    rawGuarddReceipt.Attachments[0].AttachType,
+				"program_id":     rawGuarddReceipt.Attachments[0].ProgramID,
+				"link_id":        rawGuarddReceipt.Attachments[0].LinkID,
+				"target":         rawGuarddReceipt.Attachments[0].Target,
+				"receipt_sha256": fmt.Sprintf("%x", sha256.Sum256(persistedReceipt)),
+				"receipt_file":   persisted[0].Name(),
+			},
+		)
+		t.Logf(
+			"headline=held-executable held_start=true deny_exit=%s allow_exit=%s marker=%s attachment=%s/%s receipt_sha256=%x receipt_file=%s",
+			fields[0], fields[1], strings.TrimSpace(string(marker)),
+			rawGuarddReceipt.Attachments[0].ProgramName,
+			rawGuarddReceipt.Attachments[0].AttachType,
+			sha256.Sum256(persistedReceipt), persisted[0].Name(),
+		)
+		return
 	}
 	denied, err := os.ReadFile(deny)
 	if err != nil || len(denied) != 0 {
@@ -468,6 +588,104 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 			controlBeforeStart, controlBeforeEnd, controlProof.first, controlProof.last,
 			controlProof.maxGap.Milliseconds(), guardianStatus, freezeWrite,
 		)
+	}
+}
+
+func activateExecutableHeadlinePolicy(ctx context.Context, cfg guarddRuntimeConfig, metadata v2.MutationMetadata, sessionID string, pid int, deniedExecutable string) (_ io.Closer, receipt *guarddclient.Receipt, retErr error) {
+	if err := validateGuarddRuntimeConfig(cfg); err != nil {
+		return nil, nil, err
+	}
+	component := safeCgroupComponent.ReplaceAllString(sessionID, "-")
+	if err := os.MkdirAll(cfg.CgroupRoot, 0o755); err != nil {
+		return nil, nil, err
+	}
+	cgroupPath := filepath.Join(cfg.CgroupRoot, component)
+	if err := os.Mkdir(cgroupPath, 0o755); err != nil {
+		return nil, nil, err
+	}
+	lifetime := &policyActivationLifetime{cgroupPath: cgroupPath}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, lifetime.closeLocal())
+		}
+	}()
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o600); err != nil {
+		return nil, nil, err
+	}
+	cgroup, err := os.Open(cgroupPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer cgroup.Close()
+	policySum := sha256.Sum256([]byte("exec-headline\x00" + deniedExecutable))
+	document := guarddPolicyDocument{
+		APIVersion: "agentpolicy.gadget/v1alpha1",
+		Kind:       "AgentPolicy",
+		Metadata: guarddPolicyMetadata{
+			Name:   policyName(component),
+			Digest: "sha256:" + hex.EncodeToString(policySum[:]),
+		},
+		Spec: guarddPolicySpec{
+			Subject:         guarddPolicySubject{TaskUID: string(metadata.TaskUID), SessionID: sessionID},
+			FailureMode:     "closed",
+			DenyExecutables: []guarddPolicyRule{{ID: 1, Path: deniedExecutable}},
+		},
+	}
+	policyTree := guarddPolicyMap(document)
+	policyDigest, err := guarddclient.DigestCanonicalJSON(policyTree)
+	if err != nil {
+		return nil, nil, err
+	}
+	authorizationKey, err := guarddclient.LoadPrivateKey(cfg.AuthorizationPrivateKeyFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	receiptKey, err := guarddclient.LoadPublicKey(cfg.ReceiptPublicKeyFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err := guarddclient.New(guarddclient.Config{
+		SocketPath: cfg.SocketPath, AuthorizationPrivateKey: authorizationKey,
+		AuthorizationIssuerID: cfg.AuthorizationIssuerID, BootID: kernelBootID(),
+		ReceiptPublicKey: receiptKey, ReceiptDirectory: cfg.ReceiptDirectory,
+		Timeout: 15 * time.Second,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	binding := guarddclient.Binding{
+		SessionID: sessionID, Attempt: strconv.FormatUint(uint64(metadata.TaskAttempt), 10),
+		Generation: 1, PolicyDigest: policyDigest, GadgetDigest: cfg.GadgetDigest, NodeID: cfg.NodeID,
+	}
+	receipt, err = client.Activate(ctx, binding, policyTree, cgroup)
+	if err != nil {
+		return nil, nil, err
+	}
+	lifetime.client = client
+	lifetime.binding = binding
+	return lifetime, receipt, nil
+}
+
+func exportExecutableHeadlineEvidence(t *testing.T, directory, receiptName string, receipt []byte, summary map[string]any) {
+	t.Helper()
+	if directory == "" {
+		return
+	}
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+		t.Fatalf("ORKA_LIVE_GUARDD_EVIDENCE_DIR must be clean and absolute")
+	}
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatalf("create executable headline evidence directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, receiptName), receipt, 0o600); err != nil {
+		t.Fatalf("write executable headline receipt: %v", err)
+	}
+	summaryBytes, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		t.Fatalf("encode executable headline summary: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "summary.json"), append(summaryBytes, '\n'), 0o600); err != nil {
+		t.Fatalf("write executable headline summary: %v", err)
 	}
 }
 
