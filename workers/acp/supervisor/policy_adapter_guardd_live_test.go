@@ -206,6 +206,13 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	if activationReceipt == nil || len(activationReceipt.GuarddReceipt) == 0 {
 		t.Fatal("verified guardd receipt missing")
 	}
+	if len(activationReceipt.Attachments) != 2 ||
+		activationReceipt.Attachments[0].ProgramName != "agentpolicy_open" ||
+		activationReceipt.Attachments[0].AttachType != "lsm/file_open" ||
+		activationReceipt.Attachments[1].ProgramName != "agentpolicy_permission" ||
+		activationReceipt.Attachments[1].AttachType != "lsm/file_permission" {
+		t.Fatalf("verified guardd attachments = %#v", activationReceipt.Attachments)
+	}
 	var signedReceipt string
 	if err := json.Unmarshal(activationReceipt.GuarddReceipt, &signedReceipt); err != nil {
 		t.Fatalf("decode compatibility receipt: %v", err)

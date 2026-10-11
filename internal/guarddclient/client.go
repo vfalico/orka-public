@@ -62,7 +62,17 @@ type Client struct {
 	mu       sync.Mutex
 	versions map[string]uint64
 }
-type Receipt []byte
+type AttachmentEvidence struct {
+	ProgramName string
+	ProgramID   uint32
+	LinkID      uint32
+	AttachType  string
+	Target      string
+}
+type Receipt struct {
+	Signed      []byte
+	Attachments []AttachmentEvidence
+}
 
 type requestFrame struct {
 	Protocol, Method, RequestID             string
@@ -243,7 +253,7 @@ func validateBinding(b Binding) error {
 	return nil
 }
 
-func (c *Client) Activate(ctx context.Context, b Binding, policy map[string]any, cgroup *os.File) (Receipt, error) {
+func (c *Client) Activate(ctx context.Context, b Binding, policy map[string]any, cgroup *os.File) (*Receipt, error) {
 	if cgroup == nil {
 		return nil, errors.New("cgroup file required")
 	}
@@ -309,7 +319,7 @@ func (c *Client) Activate(ctx context.Context, b Binding, policy map[string]any,
 			return nil, errors.New("fail-safe guardian watches are incomplete")
 		}
 	}
-	rp, err := c.verifyReceipt(result.Receipt, b)
+	rp, attachments, err := c.verifyReceipt(result.Receipt, b, cgroup)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +332,7 @@ func (c *Client) Activate(ctx context.Context, b Binding, policy map[string]any,
 	if err = c.persistReceipt(result.Receipt, b); err != nil {
 		return nil, fmt.Errorf("persist receipt before release: %w", err)
 	}
-	return Receipt(result.Receipt), nil
+	return &Receipt{Signed: append([]byte(nil), result.Receipt...), Attachments: attachments}, nil
 }
 func (c *Client) Action(ctx context.Context, action string, b Binding) error {
 	switch action {
@@ -435,26 +445,168 @@ func (c *Client) transact(ctx context.Context, method string, b Binding, payload
 	}
 	return r, nil
 }
-func (c *Client) verifyReceipt(receipt []byte, b Binding) (receiptPayload, error) {
+func exactMapKeys(value map[string]any, expected ...string) bool {
+	if len(value) != len(expected) {
+		return false
+	}
+	for _, key := range expected {
+		if _, ok := value[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func stringMap(value any) (map[string]any, bool) {
+	switch raw := value.(type) {
+	case map[string]any:
+		return raw, true
+	case map[any]any:
+		converted := make(map[string]any, len(raw))
+		for key, value := range raw {
+			text, ok := key.(string)
+			if !ok {
+				return nil, false
+			}
+			converted[text] = value
+		}
+		return converted, true
+	default:
+		return nil, false
+	}
+}
+
+func uint64Claim(value any) (uint64, bool) {
+	switch raw := value.(type) {
+	case uint64:
+		return raw, true
+	case int64:
+		if raw >= 0 {
+			return uint64(raw), true
+		}
+	case int:
+		if raw >= 0 {
+			return uint64(raw), true
+		}
+	}
+	return 0, false
+}
+
+func uint32Claim(value any) (uint32, bool) {
+	raw, ok := uint64Claim(value)
+	if !ok || raw == 0 || raw > uint64(^uint32(0)) {
+		return 0, false
+	}
+	return uint32(raw), true
+}
+
+func (c *Client) verifyReceipt(receipt []byte, b Binding, cgroup *os.File) (receiptPayload, []AttachmentEvidence, error) {
 	payload, err := verifySign1(receipt, c.cfg.ReceiptPublicKey, coseKID(c.cfg.ReceiptPublicKey), []byte(receiptAAD))
 	if err != nil {
-		return receiptPayload{}, err
+		return receiptPayload{}, nil, err
 	}
 	var rp receiptPayload
 	if err = decodeCanonical(payload, &rp); err != nil {
-		return rp, err
+		return rp, nil, err
 	}
 	if rp.Schema != ReceiptSchema || rp.Stage != ReceiptStage || rp.Binding != b || rp.BootID != c.cfg.BootID || rp.Sequence == 0 || rp.StateVersion == 0 {
-		return rp, errors.New("receipt claims mismatch")
+		return rp, nil, errors.New("receipt claims mismatch")
 	}
 	if rp.IssuedAtNS <= 0 || time.Unix(0, rp.IssuedAtNS).After(c.cfg.Now().Add(c.cfg.Timeout)) || time.Unix(0, rp.IssuedAtNS).Before(c.cfg.Now().Add(-5*time.Minute)) {
-		return rp, errors.New("receipt time invalid")
+		return rp, nil, errors.New("receipt time invalid")
+	}
+	if !exactMapKeys(rp.Claims, "assurance", "attachments", "cgroup", "guardian", "held") {
+		return rp, nil, errors.New("receipt claim fields mismatch")
 	}
 	held, ok := rp.Claims["held"].(bool)
 	if !ok || !held || rp.Claims["assurance"] != "worker_fd_policy_map_readback_and_fail_safe_guardian" {
-		return rp, errors.New("receipt lacks held assurance")
+		return rp, nil, errors.New("receipt lacks held assurance")
 	}
-	return rp, nil
+	var stat syscall.Stat_t
+	if cgroup == nil || syscall.Fstat(int(cgroup.Fd()), &stat) != nil || stat.Ino == 0 {
+		return rp, nil, errors.New("read exact cgroup identity for receipt")
+	}
+	cgroupClaim, ok := stringMap(rp.Claims["cgroup"])
+	claimCgroupID, cgroupIDOK := uint64Claim(cgroupClaim["cgroup_id"])
+	claimDev, devOK := uint64Claim(cgroupClaim["dev"])
+	claimIno, inoOK := uint64Claim(cgroupClaim["ino"])
+	mountID, mountOK := uint64Claim(cgroupClaim["mount_id"])
+	if !ok || !exactMapKeys(cgroupClaim, "cgroup_id", "dev", "ino", "mount_id") ||
+		!cgroupIDOK || claimCgroupID != stat.Ino || !inoOK || claimIno != stat.Ino ||
+		!devOK || claimDev != uint64(stat.Dev) || !mountOK || mountID == 0 {
+		return rp, nil, errors.New("receipt cgroup identity mismatch")
+	}
+	guardian, ok := stringMap(rp.Claims["guardian"])
+	if !ok || !exactMapKeys(guardian, "action", "armed", "pid", "watches") ||
+		guardian["armed"] != true || guardian["action"] != "freeze_exact_cgroup" {
+		return rp, nil, errors.New("receipt guardian evidence is invalid")
+	}
+	guardianPID, pidOK := uint64Claim(guardian["pid"])
+	rawWatches, watchesOK := guardian["watches"].([]any)
+	if !pidOK || guardianPID == 0 || !watchesOK || len(rawWatches) != 4 {
+		return rp, nil, errors.New("receipt guardian evidence is invalid")
+	}
+	expectedWatches := map[string]bool{
+		"cgroup_fd": true, "event_consumer_liveness": true,
+		"guardd_pidfd": true, "ig_worker_pidfd": true,
+	}
+	for _, raw := range rawWatches {
+		watch, ok := raw.(string)
+		if !ok || !expectedWatches[watch] {
+			return rp, nil, errors.New("receipt guardian watches are invalid")
+		}
+		delete(expectedWatches, watch)
+	}
+	if len(expectedWatches) != 0 {
+		return rp, nil, errors.New("receipt guardian watches are incomplete")
+	}
+	rawAttachments, ok := rp.Claims["attachments"].([]any)
+	if !ok || len(rawAttachments) == 0 || len(rawAttachments) > 16 {
+		return rp, nil, errors.New("receipt attachments are missing or outside bounds")
+	}
+	target := fmt.Sprintf("cgroup:%d", stat.Ino)
+	attachments := make([]AttachmentEvidence, 0, len(rawAttachments))
+	seenNames := map[string]bool{}
+	seenLinks := map[uint32]bool{}
+	supportedPrograms := map[string]string{
+		"agentpolicy_exec":       "lsm/bprm_check_security",
+		"agentpolicy_open":       "lsm/file_open",
+		"agentpolicy_permission": "lsm/file_permission",
+	}
+	for _, raw := range rawAttachments {
+		item, ok := stringMap(raw)
+		if !ok || !exactMapKeys(item, "attach_type", "link_id", "program_id", "program_name", "target") {
+			return rp, nil, errors.New("receipt attachment fields mismatch")
+		}
+		programName, nameOK := item["program_name"].(string)
+		attachType, attachOK := item["attach_type"].(string)
+		itemTarget, targetOK := item["target"].(string)
+		programID, programOK := uint32Claim(item["program_id"])
+		linkID, linkOK := uint32Claim(item["link_id"])
+		if !nameOK || programName == "" || !attachOK || supportedPrograms[programName] != attachType ||
+			!targetOK || itemTarget != target || !programOK || !linkOK ||
+			seenNames[programName] || seenLinks[linkID] {
+			return rp, nil, errors.New("receipt attachment evidence is invalid")
+		}
+		seenNames[programName] = true
+		seenLinks[linkID] = true
+		attachments = append(attachments, AttachmentEvidence{
+			ProgramName: programName, ProgramID: programID, LinkID: linkID,
+			AttachType: attachType, Target: itemTarget,
+		})
+	}
+	if !sort.SliceIsSorted(attachments, func(i, j int) bool {
+		if attachments[i].ProgramName != attachments[j].ProgramName {
+			return attachments[i].ProgramName < attachments[j].ProgramName
+		}
+		if attachments[i].ProgramID != attachments[j].ProgramID {
+			return attachments[i].ProgramID < attachments[j].ProgramID
+		}
+		return attachments[i].LinkID < attachments[j].LinkID
+	}) {
+		return rp, nil, errors.New("receipt attachments are not canonically ordered")
+	}
+	return rp, attachments, nil
 }
 func (c *Client) persistReceipt(r []byte, b Binding) error {
 	if err := os.MkdirAll(c.cfg.ReceiptDirectory, 0700); err != nil {

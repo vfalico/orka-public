@@ -166,7 +166,7 @@ func activateAgentPolicy(ctx context.Context, cfg guarddRuntimeConfig, policy v2
 	lifetime.client = client
 	lifetime.binding = binding
 
-	receiptBytes := []byte(guarddReceipt)
+	receiptBytes := guarddReceipt.Signed
 	receiptSum := sha256.Sum256(receiptBytes)
 	compatibilityReceipt := &v2.AgentPolicyReceipt{
 		Version: v2.AgentPolicyReceiptVersion, PolicyDigest: policy.Digest,
@@ -174,6 +174,15 @@ func activateAgentPolicy(ctx context.Context, cfg guarddRuntimeConfig, policy v2
 		RuntimeSessionID: sessionID, CgroupID: cgroupID,
 		GuarddPolicyDigest: guarddDigest, GuarddReceipt: json.RawMessage(strconv.Quote(base64.StdEncoding.EncodeToString(receiptBytes))),
 		GuarddReceiptDigest: "sha256:" + hex.EncodeToString(receiptSum[:]),
+	}
+	for _, item := range guarddReceipt.Attachments {
+		compatibilityReceipt.Attachments = append(
+			compatibilityReceipt.Attachments,
+			v2.AgentPolicyAttachmentEvidence{
+				ProgramName: item.ProgramName, ProgramID: item.ProgramID,
+				LinkID: item.LinkID, AttachType: item.AttachType, Target: item.Target,
+			},
+		)
 	}
 	compatibilityReceipt.Digest, err = compatibilityReceiptDigest(compatibilityReceipt)
 	if err != nil {

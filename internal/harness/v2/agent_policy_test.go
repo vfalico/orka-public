@@ -53,7 +53,7 @@ func TestAgentPolicyReceiptValidatesOpaqueCOSEResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt := AgentPolicyReceipt{Version: AgentPolicyReceiptVersion, PolicyDigest: policy.Digest, TaskUID: "task-uid", TaskAttempt: 2, RuntimeSessionID: "session", CgroupID: 42, GuarddPolicyDigest: policy.Digest, GuarddReceipt: encoded, GuarddReceiptDigest: "sha256:" + hex.EncodeToString(coseSum[:])}
+	receipt := AgentPolicyReceipt{Version: AgentPolicyReceiptVersion, PolicyDigest: policy.Digest, TaskUID: "task-uid", TaskAttempt: 2, RuntimeSessionID: "session", CgroupID: 42, Attachments: []AgentPolicyAttachmentEvidence{{ProgramName: "file_open", ProgramID: 6, LinkID: 7, AttachType: "lsm/file_open", Target: "cgroup:42"}, {ProgramName: "file_permission", ProgramID: 7, LinkID: 8, AttachType: "lsm/file_permission", Target: "cgroup:42"}}, GuarddPolicyDigest: policy.Digest, GuarddReceipt: encoded, GuarddReceiptDigest: "sha256:" + hex.EncodeToString(coseSum[:])}
 	copy := receipt
 	payload, err := json.Marshal(copy)
 	if err != nil {

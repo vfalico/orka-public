@@ -115,30 +115,29 @@ func (r AgentPolicyReceipt) ValidateFor(policy AgentPolicyActivation, taskUID st
 		if r.GuarddReceiptDigest != "sha256:"+hex.EncodeToString(sum[:]) {
 			return errors.New("embedded guardd receipt digest is invalid")
 		}
-	} else if len(r.Attachments) == 0 {
-		return errors.New("AgentPolicy receipt contains neither guardd receipt nor kernel attachment")
+	}
+	if len(r.Attachments) == 0 {
+		return errors.New("AgentPolicy receipt contains no verified kernel attachment")
 	}
 	expected := map[string]int{}
 	if len(policy.DenyFiles) > 0 {
-		expected["file_open/lsm/file_open"] = 1
-		expected["file_permission/lsm/file_permission"] = 1
+		expected["lsm/file_open"] = 1
+		expected["lsm/file_permission"] = 1
 	}
 	seenAttachments := map[string]int{}
 	for _, item := range r.Attachments {
 		if item.ProgramName == "" || item.ProgramID == 0 || item.LinkID == 0 || item.Target != fmt.Sprintf("cgroup:%d", cgroupID) {
 			return errors.New("AgentPolicy attachment evidence is incomplete or targets another cgroup")
 		}
-		key := item.ProgramName + "/" + item.AttachType
+		key := item.AttachType
 		seenAttachments[key]++
 		if expected[key] == 0 || seenAttachments[key] > expected[key] {
 			return fmt.Errorf("unexpected AgentPolicy attachment %q", key)
 		}
 	}
-	if len(r.GuarddReceipt) == 0 {
-		for key, count := range expected {
-			if seenAttachments[key] != count {
-				return fmt.Errorf("required AgentPolicy attachment %q is missing", key)
-			}
+	for key, count := range expected {
+		if seenAttachments[key] != count {
+			return fmt.Errorf("required AgentPolicy attachment %q is missing", key)
 		}
 	}
 	copy := r

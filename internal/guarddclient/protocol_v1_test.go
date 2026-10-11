@@ -6,8 +6,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
+	"syscall"
 	"testing"
+	"time"
 )
 
 type vectors struct {
@@ -84,6 +87,74 @@ func TestMutationsRejected(t *testing.T) {
 	}
 	if _, e := decodeResponse([]byte{0x0a, 1, 'v', 0x0a, 1, 'v'}); e == nil {
 		t.Fatal("duplicate protobuf accepted")
+	}
+}
+func TestVerifiedGuardianReceiptProjectsSignedAttachments(t *testing.T) {
+	seed := make([]byte, ed25519.SeedSize)
+	for index := range seed {
+		seed[index] = byte(index + 1)
+	}
+	key := ed25519.NewKeyFromSeed(seed)
+	pub := key.Public().(ed25519.PublicKey)
+	now := time.Unix(1700000000, 0)
+	client := &Client{cfg: Config{
+		ReceiptPublicKey: pub, BootID: "boot", Timeout: time.Second,
+		Now: func() time.Time { return now },
+	}}
+	cgroup, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cgroup.Close()
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(int(cgroup.Fd()), &stat); err != nil {
+		t.Fatal(err)
+	}
+	binding := Binding{"session", "1", 1, "sha256:" + repeat("a", 64), "sha256:" + repeat("b", 64), "node"}
+	target := "cgroup:" + fmt.Sprint(stat.Ino)
+	claims := map[string]any{
+		"assurance": "worker_fd_policy_map_readback_and_fail_safe_guardian",
+		"held":      true,
+		"cgroup": map[string]any{
+			"dev": uint64(stat.Dev), "ino": stat.Ino,
+			"mount_id": uint64(7), "cgroup_id": stat.Ino,
+		},
+		"guardian": map[string]any{
+			"armed": true, "pid": uint64(99), "action": "freeze_exact_cgroup",
+			"watches": []string{"guardd_pidfd", "ig_worker_pidfd", "event_consumer_liveness", "cgroup_fd"},
+		},
+		"attachments": []map[string]any{
+			{"program_name": "agentpolicy_open", "program_id": uint64(11), "link_id": uint64(21), "attach_type": "lsm/file_open", "target": target},
+			{"program_name": "agentpolicy_permission", "program_id": uint64(12), "link_id": uint64(22), "attach_type": "lsm/file_permission", "target": target},
+		},
+	}
+	sign := func() []byte {
+		payload, err := enc.Marshal(receiptPayload{
+			Schema: ReceiptSchema, Stage: ReceiptStage, Binding: binding,
+			Sequence: 7, PriorReceiptHash: "sha256:" + repeat("c", 64),
+			BootID: "boot", StateVersion: 3, IssuedAtNS: now.UnixNano(),
+			Claims: claims,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		signed, err := sign1(payload, key, coseKID(pub), []byte(receiptAAD))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return signed
+	}
+	receiptPayload, attachments, err := client.verifyReceipt(sign(), binding, cgroup)
+	if err != nil {
+		t.Fatalf("%v; claims=%#v", err, receiptPayload.Claims)
+	}
+	if len(attachments) != 2 || attachments[0].AttachType != "lsm/file_open" ||
+		attachments[1].ProgramName != "agentpolicy_permission" {
+		t.Fatalf("attachments = %#v", attachments)
+	}
+	claims["attachments"].([]map[string]any)[0]["target"] = "cgroup:1"
+	if _, _, err := client.verifyReceipt(sign(), binding, cgroup); err == nil {
+		t.Fatal("wrong signed attachment target accepted")
 	}
 }
 func repeat(s string, n int) string {
