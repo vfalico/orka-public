@@ -3,20 +3,24 @@
 package supervisor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -24,6 +28,7 @@ import (
 	"github.com/orka-agents/orka/internal/acp"
 	"github.com/orka-agents/orka/internal/harness/v2"
 	policyresolver "github.com/orka-agents/orka/internal/policy"
+	"golang.org/x/sys/unix"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -41,6 +46,11 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	kmxBinary := os.Getenv("ORKA_LIVE_KMX_BIN")
 	igBinary := os.Getenv("ORKA_LIVE_IG_BIN")
 	gadgetDigest := os.Getenv("ORKA_LIVE_GADGET_DIGEST")
+	fault := os.Getenv("ORKA_LIVE_GUARDD_FAULT")
+	if fault != "" && fault != "worker" && fault != "event_consumer" &&
+		fault != "guardd" && fault != "control" {
+		t.Fatalf("unsupported ORKA_LIVE_GUARDD_FAULT %q", fault)
+	}
 	if guarddSource == "" || oci == "" || kmxBinary == "" || igBinary == "" || gadgetDigest == "" {
 		t.Fatal("ORKA_LIVE_GUARDD_SOURCE, ORKA_LIVE_GUARDD_OCI, ORKA_LIVE_KMX_BIN, ORKA_LIVE_IG_BIN, and ORKA_LIVE_GADGET_DIGEST are required")
 	}
@@ -76,24 +86,42 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	}
 	defer logFile.Close()
 	launcher := filepath.Join(guarddSource, "packaging", "guardd-launch.py")
-	daemon := exec.Command("python3", launcher, "--config", configPath)
+	daemonArgs := []string{launcher, "--config", configPath}
+	faultControl := filepath.Join(temp, "fault-control.sock")
+	guarddDeathStatus := faultControl + ".guardian-status"
+	defer os.Remove(guarddDeathStatus)
+	if fault != "" {
+		daemonArgs = []string{
+			filepath.Join(repositoryRootForLiveTest(t), "workers", "acp", "supervisor", "testdata", "guardd_fault_launcher.py"),
+			"--config", configPath, "--control", faultControl,
+		}
+	}
+	daemon := exec.Command("python3", daemonArgs...)
 	daemon.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(guarddSource, "src"))
 	daemon.Stdout = logFile
 	daemon.Stderr = logFile
+	daemon.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := daemon.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
 		if daemon.Process != nil {
-			_ = daemon.Process.Kill()
+			_ = syscall.Kill(-daemon.Process.Pid, syscall.SIGKILL)
 			_ = daemon.Wait()
 		}
 	}()
 	waitForPath(t, socket, 10*time.Second)
+	if fault != "" {
+		waitForPath(t, faultControl, 10*time.Second)
+	}
 	if err := os.Mkdir(cgroupRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(cgroupRoot)
+	defer func() {
+		if err := os.Remove(cgroupRoot); err != nil && !os.IsNotExist(err) {
+			t.Errorf("remove live-test cgroup root: %v", err)
+		}
+	}()
 
 	repositoryRoot := repoRoot(t)
 	helperDir := filepath.Join("/tmp", "orka-guardd-helper-"+strconv.Itoa(os.Getpid()))
@@ -121,9 +149,23 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 	policy := renderKMXActivation(t, kmxBinary, temp, deny)
 	metadata := v2.MutationMetadata{TaskUID: v2.TaskUID("task-live"), TaskAttempt: 1}
 	guarddCfg := guarddRuntimeConfig{SocketPath: socket, AuthorizationIssuerID: "orka-production", AuthorizationPrivateKeyFile: authPrivate, ReceiptPublicKeyFile: public, ReceiptDirectory: receipts, GadgetDigest: gadgetDigest, NodeID: "node-orka-live", CgroupRoot: cgroupRoot}
+	heartbeat := filepath.Join("/tmp", "orka-guardd-heartbeat-"+token)
+	heartbeatTemp := heartbeat + ".tmp"
+	defer os.Remove(heartbeat)
+	defer os.Remove(heartbeatTemp)
 	script := fmt.Sprintf("printf denied > %q; d=$?; printf allowed > %q; a=$?; printf '%%s %%s' \"$d\" \"$a\" > %q; sleep 300", deny, allow, status)
+	if fault != "" {
+		script = fmt.Sprintf(
+			"printf denied > %s; d=$?; printf allowed > %s; a=$?; printf '%%s %%s' \"$d\" \"$a\" > %s; exec python3 -c %s",
+			liveTestShellQuote(deny), liveTestShellQuote(allow), liveTestShellQuote(status),
+			liveTestShellQuote(fmt.Sprintf("import pathlib,time\np=pathlib.Path(%q)\nt=pathlib.Path(%q)\ni=0\nwhile True:\n i+=1\n t.write_text(str(i))\n t.replace(p)\n time.sleep(0.01)", heartbeat, heartbeatTemp)),
+		)
+	}
 	var activationReceipt *v2.AgentPolicyReceipt
-	process, err := acp.StartProcess(acp.ProcessConfig{Command: "/bin/sh", Args: []string{"-c", script}, Environment: []string{"PATH=/usr/bin:/bin"}, Paths: acp.SessionPaths{Workspace: "/tmp"}, UID: 65534, GID: 65534, ExecHelperCommand: helper, ActivatePolicy: func(pid int) (io.Closer, error) {
+	var heldPID int
+	liveUID := unusedLiveTestIdentity(t)
+	process, err := acp.StartProcess(acp.ProcessConfig{Command: "/bin/sh", Args: []string{"-c", script}, Environment: []string{"PATH=/usr/bin:/bin"}, Paths: acp.SessionPaths{Workspace: "/tmp"}, UID: liveUID, GID: liveUID, ExecHelperCommand: helper, ActivatePolicy: func(pid int) (io.Closer, error) {
+		heldPID = pid
 		stateBytes, readErr := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 		if readErr != nil {
 			return nil, readErr
@@ -190,6 +232,379 @@ func TestLiveGuarddHeldStartActivation(t *testing.T) {
 		"held_start=true deny_exit=%s allow_exit=%s receipt_sha256=%x receipt_file=%s",
 		fields[0], fields[1], sha256.Sum256(persistedReceipt), persisted[0].Name(),
 	)
+	if fault != "" {
+		cgroupPath := filepath.Join(cgroupRoot, "session-live-"+token)
+		waitForPath(t, heartbeat, 5*time.Second)
+		beforeStart, beforeEnd := requireHeartbeatProgress(t, heartbeat, 2*time.Second)
+		evidence := prepareGuarddFault(t, faultControl, fault)
+		if evidence.Fault != fault || evidence.GuarddPID != daemon.Process.Pid ||
+			evidence.WorkerPID <= 1 || evidence.GuardianPID <= 1 ||
+			evidence.WorkerPID == evidence.GuardianPID ||
+			evidence.WorkerPID == evidence.GuarddPID || evidence.GuardianPID == evidence.GuarddPID {
+			t.Fatalf("invalid fault evidence: %#v", evidence)
+		}
+		pidfds := make([]int, 0, 4)
+		defer func() {
+			for _, fd := range pidfds {
+				_ = unix.PidfdSendSignal(fd, syscall.SIGKILL, nil, 0)
+			}
+			if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.freeze"), []byte("0"), 0o600); err != nil && !os.IsNotExist(err) {
+				t.Errorf("thaw test cgroup for cleanup: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if _, stopErr := process.Stop(ctx, time.Second); stopErr != nil {
+				t.Errorf("stop fault-test process: %v", stopErr)
+			}
+			if daemon.Process != nil {
+				_ = daemon.Process.Kill()
+				_ = daemon.Wait()
+			}
+			for _, fd := range pidfds {
+				_ = unix.Close(fd)
+			}
+			if removeErr := os.Remove(cgroupPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				t.Errorf("remove fault-test task cgroup: %v", removeErr)
+			}
+		}()
+		for _, pid := range []int{heldPID, evidence.GuarddPID, evidence.WorkerPID, evidence.GuardianPID} {
+			fd, openErr := unix.PidfdOpen(pid, 0)
+			if openErr != nil {
+				t.Fatalf("open pidfd for %d: %v", pid, openErr)
+			}
+			pidfds = append(pidfds, fd)
+		}
+		for index, name := range []string{"held workload", "guardd", "IG worker", "guardian"} {
+			requirePidfdAlive(t, pidfds[index], name)
+		}
+		requireCgroupUnfrozen(t, cgroupPath)
+		started := time.Now()
+		deadline := started.Add(6 * time.Second)
+		fired := fireGuarddFault(t, faultControl, fault, time.Until(deadline))
+		if fired != evidence {
+			t.Fatalf("fault identities changed between prepare and fire: prepare=%#v fire=%#v", evidence, fired)
+		}
+		if fault == "event_consumer" {
+			waitForCgroupFrozenBeforePidExit(t, cgroupPath, pidfds[2], deadline)
+		} else {
+			waitForCgroupFrozen(t, cgroupPath, deadline)
+		}
+		elapsed := time.Since(started)
+		frozenHeartbeat := requireHeartbeatStable(t, heartbeat, 500*time.Millisecond)
+		guardianStatus := guarddGuardianStatus{}
+		if fault != "guardd" && fault != "control" {
+			guardianStatus = readFaultStatus(t, faultControl)
+			expectedCause := "ig_worker_died"
+			if fault == "event_consumer" {
+				expectedCause = "event_consumer_died"
+			}
+			if guardianStatus.Cause != expectedCause || !guardianStatus.Frozen ||
+				guardianStatus.Error != nil || (fault == "worker" && !guardianStatus.Alive) {
+				t.Fatalf("unexpected guardian status for %s: %#v", fault, guardianStatus)
+			}
+		} else if fault == "guardd" {
+			waitForPidfdExit(t, pidfds[1], "guardd", time.Now().Add(2*time.Second))
+			waitForPidfdExit(t, pidfds[2], "IG worker", time.Now().Add(2*time.Second))
+			waitForPath(t, guarddDeathStatus, 2*time.Second)
+			rawStatus, readErr := os.ReadFile(guarddDeathStatus)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if err := json.Unmarshal(rawStatus, &guardianStatus); err != nil {
+				t.Fatalf("decode terminal guardian status: %v", err)
+			}
+			if guardianStatus.Cause != "guardd_died" || !guardianStatus.Frozen ||
+				guardianStatus.Error != nil {
+				t.Fatalf("unexpected guardian status for guardd death: %#v", guardianStatus)
+			}
+			waitForPidfdExit(t, pidfds[3], "guardian", time.Now().Add(2*time.Second))
+		} else {
+			requirePidfdAlive(t, pidfds[1], "guardd after control loss freeze")
+			waitForPidfdExit(t, pidfds[2], "IG worker", time.Now().Add(2*time.Second))
+			waitForPidfdExit(t, pidfds[3], "guardian", time.Now().Add(2*time.Second))
+			terminal := readFaultTerminal(t, faultControl)
+			if terminal.GuardianReturncode == nil || *terminal.GuardianReturncode != 0 ||
+				terminal.WorkerReturncode == nil || *terminal.WorkerReturncode >= 0 {
+				t.Fatalf("unexpected control-loss terminal state: %#v", terminal)
+			}
+			requirePidfdAlive(t, pidfds[1], "guardd after guardian retirement")
+		}
+		if fault == "event_consumer" {
+			waitForPidfdExit(t, pidfds[2], "IG worker", time.Now().Add(2*time.Second))
+		}
+		t.Logf(
+			"fault=%s freeze_elapsed_ms=%d guardd_pid=%d worker_pid=%d guardian_pid=%d heartbeat_before=%d heartbeat_last=%d heartbeat_frozen=%d guardian_status=%v",
+			fault, elapsed.Milliseconds(), evidence.GuarddPID, evidence.WorkerPID,
+			evidence.GuardianPID, beforeStart, beforeEnd, frozenHeartbeat, guardianStatus,
+		)
+	}
+}
+
+func liveTestShellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func repositoryRootForLiveTest(t *testing.T) string {
+	t.Helper()
+	return repoRoot(t)
+}
+
+func unusedLiveTestIdentity(t *testing.T) int {
+	t.Helper()
+	used := map[int]bool{}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			t.Fatalf("read process status for UID isolation: %v", err)
+		}
+		foundUID := false
+		for _, line := range strings.Split(string(raw), "\n") {
+			if !strings.HasPrefix(line, "Uid:") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				t.Fatalf("malformed Uid line for process %s: %q", entry.Name(), line)
+			}
+			uid, parseErr := strconv.Atoi(fields[1])
+			if parseErr != nil {
+				t.Fatalf("parse Uid for process %s: %v", entry.Name(), parseErr)
+			}
+			used[uid] = true
+			foundUID = true
+			break
+		}
+		if !foundUID {
+			t.Fatalf("process %s status has no Uid field", entry.Name())
+		}
+	}
+	for uid := 61000; uid < 62000; uid++ {
+		if !used[uid] {
+			return uid
+		}
+	}
+	t.Fatal("no unused live-test UID in [61000,62000)")
+	return 0
+}
+
+type guarddFaultEvidence struct {
+	Fault       string `json:"fault"`
+	GuarddPID   int    `json:"guardd_pid"`
+	WorkerPID   int    `json:"worker_pid"`
+	GuardianPID int    `json:"guardian_pid"`
+}
+
+type guarddGuardianStatus struct {
+	Alive  bool    `json:"alive"`
+	Cause  string  `json:"cause"`
+	Frozen bool    `json:"frozen"`
+	Error  *string `json:"error"`
+}
+
+type guarddFaultTerminal struct {
+	GuardianReturncode *int `json:"guardian_returncode"`
+	WorkerReturncode   *int `json:"worker_returncode"`
+}
+
+func faultControlRequest(t *testing.T, socketPath, command string, timeout time.Duration, output any) {
+	t.Helper()
+	connection, err := net.DialTimeout("unix", socketPath, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if timeout <= 0 {
+		t.Fatal("fault-control deadline elapsed")
+	}
+	if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(connection, command+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(connection).ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(line, output); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func prepareGuarddFault(t *testing.T, socketPath, fault string) guarddFaultEvidence {
+	t.Helper()
+	var evidence guarddFaultEvidence
+	faultControlRequest(t, socketPath, "prepare:"+fault, 2*time.Second, &evidence)
+	return evidence
+}
+
+func fireGuarddFault(t *testing.T, socketPath, fault string, timeout time.Duration) guarddFaultEvidence {
+	t.Helper()
+	var evidence guarddFaultEvidence
+	faultControlRequest(t, socketPath, "fire:"+fault, timeout, &evidence)
+	if evidence.Fault != fault {
+		t.Fatalf("fault fire mismatch: %#v", evidence)
+	}
+	return evidence
+}
+
+func readFaultStatus(t *testing.T, socketPath string) guarddGuardianStatus {
+	t.Helper()
+	status := guarddGuardianStatus{}
+	faultControlRequest(t, socketPath, "status", 2*time.Second, &status)
+	return status
+}
+
+func readFaultTerminal(t *testing.T, socketPath string) guarddFaultTerminal {
+	t.Helper()
+	terminal := guarddFaultTerminal{}
+	faultControlRequest(t, socketPath, "terminal", 2*time.Second, &terminal)
+	return terminal
+}
+
+func readHeartbeat(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || value <= 0 {
+		t.Fatalf("invalid heartbeat %q: %v", raw, err)
+	}
+	return value
+}
+
+func requireHeartbeatProgress(t *testing.T, path string, maximum time.Duration) (int, int) {
+	t.Helper()
+	start := readHeartbeat(t, path)
+	deadline := time.Now().Add(maximum)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		current := readHeartbeat(t, path)
+		if current > start {
+			return start, current
+		}
+		<-ticker.C
+	}
+	t.Fatalf("heartbeat did not advance from %d within %s", start, maximum)
+	return 0, 0
+}
+
+func requireHeartbeatStable(t *testing.T, path string, duration time.Duration) int {
+	t.Helper()
+	expected := readHeartbeat(t, path)
+	deadline := time.Now().Add(duration)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		<-ticker.C
+		if current := readHeartbeat(t, path); current != expected {
+			t.Fatalf("heartbeat advanced after confirmed freeze: before=%d after=%d", expected, current)
+		}
+	}
+	return expected
+}
+
+func requirePidfdAlive(t *testing.T, pidfd int, name string) {
+	t.Helper()
+	pollfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	if _, err := unix.Poll(pollfds, 0); err != nil {
+		t.Fatalf("poll %s pidfd: %v", name, err)
+	}
+	if pollfds[0].Revents != 0 {
+		t.Fatalf("%s exited before fault injection: pidfd events=%#x", name, pollfds[0].Revents)
+	}
+}
+
+func waitForPidfdExit(t *testing.T, pidfd int, name string, deadline time.Time) {
+	t.Helper()
+	pollfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	for time.Now().Before(deadline) {
+		if _, err := unix.Poll(pollfds, 10); err != nil {
+			t.Fatalf("poll %s pidfd: %v", name, err)
+		}
+		if pollfds[0].Revents != 0 {
+			return
+		}
+	}
+	t.Fatalf("%s did not exit before deadline", name)
+}
+
+func requireCgroupUnfrozen(t *testing.T, cgroupPath string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.events"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(raw))
+	for index := 0; index+1 < len(fields); index += 2 {
+		if fields[index] == "frozen" {
+			if fields[index+1] != "0" {
+				t.Fatalf("cgroup froze before fault injection: %q", raw)
+			}
+			return
+		}
+	}
+	t.Fatalf("cgroup.events has no frozen field: %q", raw)
+}
+
+func waitForCgroupFrozenBeforePidExit(t *testing.T, cgroupPath string, pidfd int, deadline time.Time) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.events"))
+		if err != nil {
+			lastErr = err
+		} else {
+			fields := strings.Fields(string(raw))
+			for index := 0; index+1 < len(fields); index += 2 {
+				if fields[index] == "frozen" && fields[index+1] == "1" {
+					return
+				}
+			}
+			lastErr = fmt.Errorf("frozen field is not 1: %q", raw)
+		}
+		requirePidfdAlive(t, pidfd, "IG worker before confirmed freeze")
+		<-ticker.C
+	}
+	t.Fatalf("cgroup did not freeze before deadline: %v", lastErr)
+}
+
+func waitForCgroupFrozen(t *testing.T, cgroupPath string, deadline time.Time) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.events"))
+		if err != nil {
+			lastErr = err
+		} else {
+			fields := strings.Fields(string(raw))
+			for index := 0; index+1 < len(fields); index += 2 {
+				if fields[index] == "frozen" && fields[index+1] == "1" {
+					return
+				}
+			}
+			lastErr = fmt.Errorf("frozen field is not 1: %q", raw)
+		}
+		<-ticker.C
+	}
+	t.Fatalf("cgroup did not freeze before deadline: %v", lastErr)
 }
 
 func renderKMXActivation(t *testing.T, kmxBinary, temp, deny string) v2.AgentPolicyActivation {
