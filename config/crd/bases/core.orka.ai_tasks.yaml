@@ -1333,6 +1333,30 @@ spec:
                     description: NodeSelector constrains worker pods to nodes with
                       matching labels.
                     type: object
+                  requirement:
+                    description: Requirement is immutable per execution and fails
+                      closed without a qualified backend.
+                    properties:
+                      format:
+                        type: string
+                      identity:
+                        type: string
+                      payloadDigest:
+                        type: string
+                      policyBytes:
+                        format: byte
+                        type: string
+                      requiredCapabilities:
+                        items:
+                          type: string
+                        type: array
+                    required:
+                    - format
+                    - identity
+                    - payloadDigest
+                    - policyBytes
+                    - requiredCapabilities
+                    type: object
                   runtimeClassName:
                     description: RuntimeClassName routes worker pods through a specific
                       RuntimeClass.

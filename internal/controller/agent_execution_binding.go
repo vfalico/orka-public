@@ -75,6 +75,7 @@ type agentExecutionCandidate struct {
 // record frozen into the immutable snapshot. Credentials remain references
 // only; raw credential values and TxTokens never enter this structure.
 type agentExecutionSnapshotBody struct {
+	Requirement      *harnessv2.ExecutionRequirement        `json:"requirement,omitempty"`
 	SchemaVersion    int32                                  `json:"schemaVersion"`
 	ContractVersion  string                                 `json:"contractVersion"`
 	Backend          string                                 `json:"backend"`
@@ -474,6 +475,21 @@ func (r *TaskReconciler) resolveAgentExecutionCandidateWithWorkspaceSessionUID(
 		Workspace:        task.Spec.Workspace.DeepCopy(),
 		RuntimeOverride:  task.Spec.AgentRuntime.DeepCopy(),
 		Connections:      frozenConnections,
+	}
+	if task.Spec.Execution != nil && task.Spec.Execution.Requirement != nil {
+		raw, err := json.Marshal(task.Spec.Execution.Requirement)
+		if err != nil {
+			return nil, err
+		}
+		if err = json.Unmarshal(raw, &body.Requirement); err != nil {
+			return nil, err
+		}
+		if err = body.Requirement.Validate(); err != nil {
+			return nil, err
+		}
+		if task.Spec.SessionRef != nil {
+			return nil, fmt.Errorf("mandatory requirement currently requires task-scoped ACP session")
+		}
 	}
 	if task.Spec.Timeout != nil {
 		body.Timeout = task.Spec.Timeout.Duration.String()

@@ -156,7 +156,7 @@ func (s *Server) handleCaptureNativeSession(w http.ResponseWriter, r *http.Reque
 	snapshot, captureErr := s.captureNativeSession(ctx, state, limit)
 	s.mu.Lock()
 	capture.snapshot = snapshot
-	capture.descriptor = state.descriptor
+	capture.descriptor = sessionDescriptorLocked(state)
 	if captureErr != nil {
 		capture.failure = captureErr.Error()
 		capture.failureCode = harnessv2.ErrorCodeSessionPoisoned

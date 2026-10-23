@@ -177,6 +177,9 @@ func newDeleteRetryRuntimeSession(t *testing.T, grace time.Duration) *RuntimeSes
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := FinalizeSessionOwnership(paths.Root, uid, gid); err != nil {
+		t.Fatal(err)
+	}
 	environment, err := BuildChildEnvironment(paths, EnvironmentConfig{Values: map[string]string{
 		"GO_WANT_ACP_HELPER":              "1",
 		"GO_WANT_ACP_DELETE_RETRY_HELPER": "1",

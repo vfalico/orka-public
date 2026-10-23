@@ -38,6 +38,14 @@ func newChildCommand(cfg ProcessConfig) (*exec.Cmd, error) {
 	helperArgs = append(helperArgs, cfg.Args...)
 	cmd := exec.Command(helperCommand, helperArgs...)
 	cmd.SysProcAttr = childSysProcAttr(cfg.UID, cfg.GID)
+	if cfg.BeforeExec != nil {
+		if os.Geteuid() != 0 || cfg.CgroupFD < 0 {
+			return nil, fmt.Errorf("governed launch requires root supervisor and cgroup handle")
+		}
+		cmd.SysProcAttr.UseCgroupFD = true
+		cmd.SysProcAttr.CgroupFD = cfg.CgroupFD
+		cmd.SysProcAttr.PidFD = new(int)
+	}
 	return cmd, nil
 }
 
@@ -45,6 +53,10 @@ func newChildCommand(cfg ProcessConfig) (*exec.Cmd, error) {
 // limits to the current process, and only then replaces it with the adapter.
 // It is exported solely for cmd/orka-acp-exec-helper.
 func RunExecHelper(args, environment []string) error {
+	if len(args) > 0 && args[0] == "--held" {
+		helperHeld = true
+		args = args[1:]
+	}
 	invocation, err := parseExecHelperInvocation(args)
 	if err != nil {
 		return err
@@ -54,6 +66,9 @@ func RunExecHelper(args, environment []string) error {
 	}
 	if err := applyCurrentProcessLimits(); err != nil {
 		return fmt.Errorf("apply child resource limits: %w", err)
+	}
+	if err := waitExecGate(environment, invocation.parentPID); err != nil {
+		return err
 	}
 	argv := append([]string{invocation.command}, invocation.args...)
 	return unix.Exec(invocation.command, argv, environment)
@@ -378,4 +393,11 @@ func signalProcessesForUID(uid int, signal os.Signal) (bool, error) {
 		}
 	}
 	return true, first
+}
+
+func (p *Process) PidFD() int {
+	if p == nil || p.cmd.SysProcAttr == nil || p.cmd.SysProcAttr.PidFD == nil {
+		return -1
+	}
+	return *p.cmd.SysProcAttr.PidFD
 }

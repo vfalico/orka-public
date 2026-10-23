@@ -76,6 +76,8 @@ func (f WorkspaceMaterializerFunc) Materialize(ctx context.Context, request harn
 }
 
 type Config struct {
+	RequirementBackends []RequirementBackend
+	ExecHelperCommand   string
 	// Tracer belongs to this supervisor. Nil disables instrumentation. It never
 	// enters the provider process configuration or environment.
 	Tracer        trace.Tracer

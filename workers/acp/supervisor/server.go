@@ -238,6 +238,7 @@ func sessionCreationStage(err error) string {
 }
 
 type sessionState struct {
+	enforcement             *selectedEnforcement
 	supportsNativeSessions  bool
 	nativeInstallUnresolved *failedCreateReplay
 	createCleanupUnproven   *failedCreateReplay
@@ -666,6 +667,7 @@ func (s *Server) status() harnessv2.StatusResponse {
 	for _, state := range s.sessions {
 		pruneSessionOperationsLocked(state, now)
 		status := harnessv2.RuntimeSessionStatus{
+			Enforcement:             state.enforcement.snapshot(),
 			NativeInstallUnresolved: state.nativeInstallUnresolved != nil,
 			NativeRestoration:       state.descriptor.NativeRestoration,
 			RuntimeSessionID:        state.descriptor.RuntimeSessionID,
@@ -811,7 +813,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 				writeError(w, replay.statusCode, replay.code, replay.message, nil, replay.retryable)
 				return
 			}
-			response := harnessv2.CreateRuntimeSessionResponse{Protocol: harnessv2.ProtocolVersion, Classification: classification, Session: existing.descriptor}
+			response := harnessv2.CreateRuntimeSessionResponse{Protocol: harnessv2.ProtocolVersion, Classification: classification, Session: sessionDescriptorLocked(existing)}
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, response)
 			return
@@ -922,6 +924,8 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	state.runtime = runtimeSession
 	state.promptMutations = runtimeSession
 	state.descriptor = descriptor
+	state.descriptor.Enforcement = state.enforcement.snapshot()
+	descriptor = state.descriptor
 	state.paths = paths
 	state.baseline = baseline
 	state.workspaceIntent = request.Workspace.Intent
@@ -964,6 +968,29 @@ func (s *Server) createSession(
 	resultBaseline *workspacedelta.Snapshot, resultProviderProxy *providerProxySession, resultMCPProxy *mcpProxySession,
 	resultDiagnosticFilter *AgentDiagnosticFilter, resultErr error,
 ) {
+	var launchEnforcer acp.LaunchEnforcer
+	if request.Requirement != nil {
+		if request.NativeRestore != nil {
+			return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, nil, sessionCreationFailed("mandatory requirement native restore", fmt.Errorf("task-scoped governed session cannot import native state"))
+		}
+		backend, err := selectRequirementBackend(ctx, s.cfg.RequirementBackends, request.Requirement)
+		if err != nil {
+			return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, nil, sessionCreationFailed("mandatory requirement support", err)
+		}
+		selection := &selectedEnforcement{backend: backend.Identity(), requirement: request.Requirement.Identity}
+		s.mu.Lock()
+		state := s.sessions[request.RuntimeSessionID]
+		// Bind only to this accepted create, never to a replacement session.
+		if state != nil && state.descriptor.RuntimeSessionUID == request.Metadata.Fence.RuntimeSessionUID && state.descriptor.Generation == request.Metadata.Fence.RuntimeSessionGeneration {
+			state.enforcement = selection
+		}
+		s.mu.Unlock()
+		launchEnforcer, err = backend.Launch(ctx, request)
+		selection.setLaunch(launchEnforcer, err)
+		if err != nil {
+			return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, nil, sessionCreationFailed("mandatory requirement preparation", err)
+		}
+	}
 	if err := s.validateNativeRestoreSize(request); err != nil {
 		return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, nil, sessionCreationFailed("native session size", err)
 	}
@@ -1294,17 +1321,19 @@ func (s *Server) createSession(
 		}
 	}
 	runtimeSession, err := acp.NewRuntimeSession(ctx, acp.RuntimeSessionConfig{
+		Enforcer:      launchEnforcer,
 		ID:            string(request.RuntimeSessionID),
 		Generation:    int64(request.Metadata.Fence.RuntimeSessionGeneration),
 		ProfileDigest: string(request.Metadata.Fence.RuntimeProfileDigest),
 		Process: acp.ProcessConfig{
-			Command:       s.cfg.Provider.Command,
-			Args:          append(append([]string(nil), s.cfg.Provider.Args...), projection.AdditionalArgs...),
-			Environment:   environment,
-			Paths:         paths,
-			UID:           uid,
-			GID:           gid,
-			ClientOptions: acp.Options{MaxMessageBytes: s.cfg.Capabilities.Limits.MaxRequestBytes},
+			ExecHelperCommand: s.cfg.ExecHelperCommand,
+			Command:           s.cfg.Provider.Command,
+			Args:              append(append([]string(nil), s.cfg.Provider.Args...), projection.AdditionalArgs...),
+			Environment:       environment,
+			Paths:             paths,
+			UID:               uid,
+			GID:               gid,
+			ClientOptions:     acp.Options{MaxMessageBytes: s.cfg.Capabilities.Limits.MaxRequestBytes},
 		},
 		MCPServers:            []acp.MCPServer{mcpServer},
 		NewSessionMeta:        projection.NewSessionMeta,

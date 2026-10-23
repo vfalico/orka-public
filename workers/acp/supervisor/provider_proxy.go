@@ -67,6 +67,7 @@ const (
 )
 
 type ProviderProxyConfig struct {
+	ListenAddress         string
 	UpstreamBaseURL       string
 	UpstreamBearerToken   string
 	ProviderKind          string
@@ -250,7 +251,15 @@ func newProviderProxy(cfg ProviderProxyConfig) (*providerProxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	listenAddress := cfg.ListenAddress
+	if listenAddress == "" {
+		listenAddress = "127.0.0.1:0"
+	}
+	host, _, err := net.SplitHostPort(listenAddress)
+	if err != nil || host != "127.0.0.1" {
+		return nil, fmt.Errorf("provider proxy must bind explicit IPv4 loopback")
+	}
+	listener, err := net.Listen("tcp4", listenAddress)
 	if err != nil {
 		return nil, fmt.Errorf("listen on provider proxy loopback: %w", err)
 	}

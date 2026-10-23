@@ -1235,7 +1235,7 @@ func (s *Server) handleFinalizeSessionPublication(w http.ResponseWriter, r *http
 	}
 	state.descriptor.LastTransitionAt = now
 	recordSessionOperationLocked(state, request.Metadata, harnessv2.OperationPhaseApplied, "", now)
-	descriptor := state.descriptor
+	descriptor := sessionDescriptorLocked(state)
 	mcpProxy := state.mcpProxy
 	drainCleanup := s.drain.Requested && !state.drainCleanupScheduled && isDrainCleanupState(state)
 	if drainCleanup {

@@ -373,6 +373,7 @@ func (b SessionBootstrap) Validate() error {
 }
 
 type CreateRuntimeSessionRequest struct {
+	Requirement                    *ExecutionRequirement      `json:"requirement,omitempty"`
 	Protocol                       string                     `json:"protocol"`
 	Metadata                       MutationMetadata           `json:"metadata"`
 	RuntimeSessionID               RuntimeSessionID           `json:"runtimeSessionID"`
@@ -387,6 +388,9 @@ type CreateRuntimeSessionRequest struct {
 }
 
 func (r CreateRuntimeSessionRequest) ValidateAt(now time.Time) error {
+	if err := r.Requirement.Validate(); err != nil {
+		return err
+	}
 	if err := validateProtocol(r.Protocol); err != nil {
 		return err
 	}
@@ -453,22 +457,68 @@ func (r CreateRuntimeSessionRequest) ValidateAt(now time.Time) error {
 	return r.Metadata.ValidateDigest(r)
 }
 
+// RequirementEnforcementStatus projects the existing launch association into
+// authenticated execution status. It is observational, not a new lifecycle or
+// permission to release/resume. Backend is the configured identity@revision.
+// An absent target is normal before Prepare; a replacement clears old identity.
+type RequirementEnforcementStatus struct {
+	Backend             string `json:"backend"`
+	RequirementIdentity string `json:"requirementIdentity"`
+	TargetGeneration    uint64 `json:"targetGeneration,omitempty"`
+	TargetIdentity      string `json:"targetIdentity,omitempty"`
+	Phase               string `json:"phase"`
+}
+
+// Validate checks association shape only; status is never activation authority.
+func (s *RequirementEnforcementStatus) Validate() error {
+	if s == nil {
+		return nil
+	}
+	if err := validateBoundedString("enforcement backend", s.Backend, true, 256); err != nil {
+		return err
+	}
+	if err := validateSHA256Digest(s.RequirementIdentity); err != nil {
+		return err
+	}
+	switch s.Phase {
+	case "selected", "preparing", "activating", "active", "cancelled", "failed", "cleanup-pending", "cleaned", "stopping", "stopped", "uncertain":
+	default:
+		return fmt.Errorf("unknown enforcement observation %q", s.Phase)
+	}
+	if s.TargetIdentity != "" {
+		if s.TargetGeneration == 0 {
+			return fmt.Errorf("enforcement target requires generation")
+		}
+		if err := validateSHA256Digest(s.TargetIdentity); err != nil {
+			return err
+		}
+	}
+	if s.Phase == "active" && (s.TargetGeneration == 0 || s.TargetIdentity == "") {
+		return fmt.Errorf("active enforcement requires exact target")
+	}
+	return nil
+}
+
 type RuntimeSessionDescriptor struct {
-	RuntimeSessionID     RuntimeSessionID          `json:"runtimeSessionID"`
-	RuntimeSessionUID    RuntimeSessionUID         `json:"runtimeSessionUID"`
-	Generation           uint64                    `json:"generation"`
-	RuntimeInstanceID    RuntimeInstanceID         `json:"runtimeInstanceID"`
-	SupervisorBootID     SupervisorBootID          `json:"supervisorBootID"`
-	RuntimeProfileDigest ProfileDigest             `json:"runtimeProfileDigest"`
-	State                RuntimeSessionState       `json:"state"`
-	NativeRestoration    *NativeSessionRestoration `json:"nativeRestoration,omitempty"`
-	ProviderSessionID    string                    `json:"providerSessionID"`
-	WorkspaceBaseline    WorkspaceBaseline         `json:"workspaceBaseline"`
-	CreatedAt            time.Time                 `json:"createdAt"`
-	LastTransitionAt     time.Time                 `json:"lastTransitionAt"`
+	Enforcement          *RequirementEnforcementStatus `json:"enforcement,omitempty"`
+	RuntimeSessionID     RuntimeSessionID              `json:"runtimeSessionID"`
+	RuntimeSessionUID    RuntimeSessionUID             `json:"runtimeSessionUID"`
+	Generation           uint64                        `json:"generation"`
+	RuntimeInstanceID    RuntimeInstanceID             `json:"runtimeInstanceID"`
+	SupervisorBootID     SupervisorBootID              `json:"supervisorBootID"`
+	RuntimeProfileDigest ProfileDigest                 `json:"runtimeProfileDigest"`
+	State                RuntimeSessionState           `json:"state"`
+	NativeRestoration    *NativeSessionRestoration     `json:"nativeRestoration,omitempty"`
+	ProviderSessionID    string                        `json:"providerSessionID"`
+	WorkspaceBaseline    WorkspaceBaseline             `json:"workspaceBaseline"`
+	CreatedAt            time.Time                     `json:"createdAt"`
+	LastTransitionAt     time.Time                     `json:"lastTransitionAt"`
 }
 
 func (d RuntimeSessionDescriptor) Validate() error {
+	if err := d.Enforcement.Validate(); err != nil {
+		return err
+	}
 	if err := requireIdentifier("runtime session ID", string(d.RuntimeSessionID)); err != nil {
 		return err
 	}

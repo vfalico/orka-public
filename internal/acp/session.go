@@ -37,6 +37,7 @@ var ErrPromptLeaseExpired = errors.New("prompt lease deadline must be in the fut
 var ErrPromptActivationExpired = errors.New("prompt lease deadline expired during capability activation")
 
 type RuntimeSessionConfig struct {
+	Enforcer       LaunchEnforcer
 	ID             string
 	Generation     int64
 	ProfileDigest  string
@@ -345,9 +346,37 @@ func NewRuntimeSession(ctx context.Context, cfg RuntimeSessionConfig) (*RuntimeS
 // the same way.
 func (s *RuntimeSession) launchAdapter(ctx context.Context) (*Process, AgentCapabilities, error) {
 	cfg := s.config
+	if cfg.Enforcer != nil {
+		if err := cfg.Enforcer.Prepare(ctx, &cfg.Process); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			if cleanupErr := cfg.Enforcer.AbortPreparation(cleanupCtx); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("preparation cleanup unfinished: %w", cleanupErr))
+			}
+			return nil, AgentCapabilities{}, err
+		}
+	}
+	cfg.Process.LaunchContext = ctx
 	process, err := StartProcess(cfg.Process)
 	if err != nil {
-		return nil, AgentCapabilities{}, err
+		if process == nil && cfg.Enforcer != nil {
+			if cleanupErr := cfg.Enforcer.AbortPreparation(ctx); cleanupErr != nil {
+				return nil, AgentCapabilities{}, errors.Join(err, fmt.Errorf("pre-start cleanup unfinished: %w", cleanupErr))
+			}
+		}
+		return process, AgentCapabilities{}, err
+	}
+	if cfg.Process.BeforeExec != nil {
+		s.mu.Lock()
+		if s.deleted || ctx.Err() != nil {
+			s.mu.Unlock()
+			return process, AgentCapabilities{}, fmt.Errorf("execution cancelled before release")
+		}
+		err = process.Release()
+		s.mu.Unlock()
+		if err != nil {
+			return process, AgentCapabilities{}, err
+		}
 	}
 	clientInfo := cfg.ClientInfo
 	if clientInfo.Name == "" {

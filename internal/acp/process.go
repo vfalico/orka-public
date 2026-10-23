@@ -35,18 +35,27 @@ type ProcessConfig struct {
 	StderrLimit       int
 	ClientOptions     Options
 	ExecHelperCommand string
+	// BeforeExec is invoked with the trusted helper held before adapter execution.
+	BeforeExec    func(context.Context, *Process) error
+	LaunchContext context.Context
+	CgroupFD      int
 }
 
 type Process struct {
-	cmd    *exec.Cmd
-	client *Client
-	stderr *boundedBuffer
-	uid    int
+	launchMu      sync.Mutex
+	stopRequested bool
+	released      bool
+	cmd           *exec.Cmd
+	client        *Client
+	stderr        *boundedBuffer
+	uid           int
 
 	done     chan struct{}
 	waitMu   sync.Mutex
 	waitErr  error
 	stopOnce sync.Once
+	gate     *execGate
+	cleanup  func(context.Context) error
 }
 
 type CleanupStatus struct {
@@ -75,6 +84,11 @@ func StartProcess(cfg ProcessConfig) (*Process, error) {
 	if err != nil {
 		return nil, err
 	}
+	gate, err := prepareExecGate(cmd, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer gate.closeParentCopies()
 	cmd.Dir = cfg.Paths.Workspace
 	cmd.Env = append([]string(nil), cfg.Environment...)
 
@@ -98,6 +112,7 @@ func StartProcess(cfg ProcessConfig) (*Process, error) {
 		client: NewClient(stdout, stdin, cfg.ClientOptions),
 		stderr: stderr,
 		uid:    cfg.UID,
+		gate:   gate,
 		done:   make(chan struct{}),
 	}
 	go func() {
@@ -108,7 +123,58 @@ func StartProcess(cfg ProcessConfig) (*Process, error) {
 		_ = stdin.Close()
 		close(process.done)
 	}()
+	if cfg.BeforeExec != nil {
+		ctx := cfg.LaunchContext
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := gate.ready(ctx); err != nil {
+			return process, err
+		}
+		if err := cfg.BeforeExec(ctx, process); err != nil {
+			return process, err
+		}
+	}
 	return process, nil
+}
+
+// SetEnforcementCleanup retains backend ownership until exact cleanup succeeds.
+func (p *Process) SetEnforcementCleanup(cleanup func(context.Context) error) { p.cleanup = cleanup }
+func (p *Process) Release() error {
+	p.launchMu.Lock()
+	defer p.launchMu.Unlock()
+	if p.stopRequested {
+		return fmt.Errorf("process stop won before exec release")
+	}
+	select {
+	case <-p.done:
+		return fmt.Errorf("held process exited before release")
+	default:
+	}
+	if err := p.gate.release(); err != nil {
+		return err
+	}
+	p.released = true
+	return nil
+}
+
+// LaunchState observes the existing release/stop linearization point. It is
+// diagnostic only and never authorizes release or infers enforcement from life.
+func (p *Process) LaunchState() string {
+	p.launchMu.Lock()
+	defer p.launchMu.Unlock()
+	select {
+	case <-p.done:
+		return "stopped"
+	default:
+	}
+	if p.stopRequested {
+		return "stopping"
+	}
+	if p.released {
+		return "released"
+	}
+	return "held"
 }
 
 func (p *Process) Client() *Client {
@@ -149,6 +215,14 @@ func (p *Process) Wait(ctx context.Context) error {
 }
 
 func (p *Process) Stop(ctx context.Context, grace time.Duration) (CleanupStatus, error) {
+	if p != nil {
+		p.launchMu.Lock()
+		p.stopRequested = true
+		if p.gate != nil && p.gate.releaseWrite != nil {
+			p.gate.releaseWrite.Close()
+		}
+		p.launchMu.Unlock()
+	}
 	if p == nil || p.cmd == nil || p.cmd.Process == nil {
 		return CleanupStatus{Proven: true}, nil
 	}
@@ -163,6 +237,13 @@ func (p *Process) Stop(ctx context.Context, grace time.Duration) (CleanupStatus,
 		return status, err
 	}
 	if complete {
+		if p.cleanup != nil {
+			if err := p.cleanup(ctx); err != nil {
+				status.Proven = false
+				return status, err
+			}
+			p.cleanup = nil
+		}
 		return status, nil
 	}
 
@@ -173,6 +254,13 @@ func (p *Process) Stop(ctx context.Context, grace time.Duration) (CleanupStatus,
 	}
 	if !complete {
 		return status, fmt.Errorf("ACP adapter descendant cleanup could not be proven")
+	}
+	if p.cleanup != nil {
+		if err := p.cleanup(ctx); err != nil {
+			status.Proven = false
+			return status, err
+		}
+		p.cleanup = nil
 	}
 	return status, nil
 }

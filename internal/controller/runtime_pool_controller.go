@@ -312,6 +312,7 @@ func validateRuntimePoolProviderToken(token []byte) error {
 
 // RuntimePoolReconciler reconciles controller-owned built-in ACP runtime pools.
 type RuntimePoolReconciler struct {
+	Enforcement RuntimePoolEnforcement
 	client.Client
 	APIReader client.Reader
 	Scheme    *k8sruntime.Scheme
@@ -791,6 +792,9 @@ func (r *RuntimePoolReconciler) runtimePoolConfigWithImageAdmission(
 	pool *corev1alpha1.RuntimePool,
 	enforceApprovedImage bool,
 ) (runtimePoolConfig, error) {
+	if err := r.validateRuntimePoolEnforcement(pool); err != nil {
+		return runtimePoolConfig{}, err
+	}
 	nativeSessionMaxBytes, err := harnessv2.NormalizeNativeSessionMaxBytes(r.NativeSessionMaxBytes)
 	if err != nil {
 		return runtimePoolConfig{}, err
@@ -1771,10 +1775,19 @@ func (r *RuntimePoolReconciler) ensureRuntimePoolNamespace(ctx context.Context, 
 	namespace := &corev1.Namespace{}
 	err := reader.Get(ctx, types.NamespacedName{Name: cfg.namespace}, namespace)
 	if err == nil {
+		// HostPath and supervisor SYS_PTRACE are incompatible with baseline
+		// admission. Never relabel an existing namespace or silently weaken
+		// the default. Operators explicitly provision this trusted lane.
+		if r.Enforcement.Directory != "" && namespace.Labels["pod-security.kubernetes.io/enforce"] != "privileged" {
+			return fmt.Errorf("node-local enforcement requires explicitly provisioned privileged-admission runtime namespace")
+		}
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
+	}
+	if r.Enforcement.Directory != "" {
+		return fmt.Errorf("node-local enforcement runtime namespace must be provisioned by operator before launch")
 	}
 	namespace = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 		Name: cfg.namespace,
@@ -2556,6 +2569,7 @@ func (r *RuntimePoolReconciler) runtimePoolPodTemplate(
 	// unreachable after runtimePoolToolboxAdmission; the template then omits
 	// the toolbox projection and the supervisor's digest check fails closed.
 	_ = applyRuntimePoolToolboxTemplate(&template, cfg.profile.Toolboxes, r.ToolboxPolicy)
+	r.Enforcement.apply(&template)
 	template.Annotations[runtimePoolTemplateRevisionAnnotation] = runtimePoolPodTemplateRevision(template)
 	return template
 }

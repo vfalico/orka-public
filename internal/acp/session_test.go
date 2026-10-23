@@ -347,6 +347,9 @@ func newTestRuntimeSessionWithOptions(t *testing.T, mode string, newSessionMeta 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := FinalizeSessionOwnership(paths.Root, uid, gid); err != nil {
+		t.Fatal(err)
+	}
 	values := map[string]string{
 		"GO_WANT_ACP_HELPER":   "1",
 		"ACP_HELPER_MODE":      mode,

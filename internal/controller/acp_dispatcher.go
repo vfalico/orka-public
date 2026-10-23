@@ -1393,6 +1393,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		)
 	}
 	createRequest := harnessv2.CreateRuntimeSessionRequest{
+		Requirement:      bound.body.Requirement.Clone(),
 		Protocol:         harnessv2.ProtocolVersion,
 		Metadata:         mutationMetadata(runtimeFence, task, createOperation, false, createExpiresAt),
 		RuntimeSessionID: harnessv2.RuntimeSessionID(runtimeSessionID(runtimeFence)),

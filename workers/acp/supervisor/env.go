@@ -1,14 +1,17 @@
 package supervisor
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	enforcerbackend "github.com/orka-agents/orka/workers/acp/supervisor/enforcementunix"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/orka-agents/orka/internal/acp"
@@ -360,6 +363,21 @@ func LoadConfigFromEnv() (Config, error) {
 	if providerKind == providerKindFoundry {
 		// Remote Hosted Agent stop/delete must complete before settlement.
 		cfg.CancelGrace = foundryCleanupTimeout
+	}
+	cfg.ExecHelperCommand = strings.TrimSpace(os.Getenv("ORKA_ACP_EXEC_HELPER_COMMAND"))
+	cfg.ProviderProxy.ListenAddress = strings.TrimSpace(os.Getenv("ORKA_ACP_PROVIDER_PROXY_LISTEN_ADDRESS"))
+	if path := strings.TrimSpace(os.Getenv("ORKA_ACP_ENFORCER_CONFIG_FILE")); path != "" {
+		backend, err := enforcerbackend.ReadBackendForInstance(path, strings.TrimSpace(os.Getenv(EnvPodUID)))
+		if err != nil {
+			return Config{}, fmt.Errorf("configure mandatory backend: %w", err)
+		}
+		retireCtx, retireCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		retireErr := backend.RetireUnfinished(retireCtx)
+		retireCancel()
+		if retireErr != nil {
+			return Config{}, fmt.Errorf("unfinished mandatory execution cleanup: %w", retireErr)
+		}
+		cfg.RequirementBackends = []RequirementBackend{backend}
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err

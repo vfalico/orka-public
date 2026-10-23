@@ -40,26 +40,27 @@ const (
 // may admit work. Evidence lives in the pool namespace, independently of its
 // cross-namespace Pod and independently of the mutable ActiveInstance pointer.
 type runtimePoolBootWitness struct {
-	SchemaVersion  int             `json:"schemaVersion"`
-	PoolNamespace  string          `json:"poolNamespace"`
-	PoolName       string          `json:"poolName"`
-	PoolUID        types.UID       `json:"poolUID"`
-	Provider       string          `json:"provider"`
-	Fence          harnessv2.Fence `json:"fence"`
-	PodNamespace   string          `json:"podNamespace"`
-	PodName        string          `json:"podName"`
-	PodUID         types.UID       `json:"podUID"`
-	PodAddress     string          `json:"podAddress"`
-	PodSpecDigest  string          `json:"podSpecDigest"`
-	DeploymentName string          `json:"deploymentName"`
-	DeploymentUID  types.UID       `json:"deploymentUID"`
-	ReplicaSetName string          `json:"replicaSetName"`
-	ReplicaSetUID  types.UID       `json:"replicaSetUID"`
-	TemplateDigest string          `json:"templateDigest"`
-	ContainerID    string          `json:"containerID"`
-	ImageID        string          `json:"imageID"`
-	RestartCount   int32           `json:"restartCount"`
-	StartedAt      metav1.Time     `json:"startedAt"`
+	SchemaVersion  int                     `json:"schemaVersion"`
+	Enforcement    *RuntimePoolEnforcement `json:"enforcement,omitempty"`
+	PoolNamespace  string                  `json:"poolNamespace"`
+	PoolName       string                  `json:"poolName"`
+	PoolUID        types.UID               `json:"poolUID"`
+	Provider       string                  `json:"provider"`
+	Fence          harnessv2.Fence         `json:"fence"`
+	PodNamespace   string                  `json:"podNamespace"`
+	PodName        string                  `json:"podName"`
+	PodUID         types.UID               `json:"podUID"`
+	PodAddress     string                  `json:"podAddress"`
+	PodSpecDigest  string                  `json:"podSpecDigest"`
+	DeploymentName string                  `json:"deploymentName"`
+	DeploymentUID  types.UID               `json:"deploymentUID"`
+	ReplicaSetName string                  `json:"replicaSetName"`
+	ReplicaSetUID  types.UID               `json:"replicaSetUID"`
+	TemplateDigest string                  `json:"templateDigest"`
+	ContainerID    string                  `json:"containerID"`
+	ImageID        string                  `json:"imageID"`
+	RestartCount   int32                   `json:"restartCount"`
+	StartedAt      metav1.Time             `json:"startedAt"`
 }
 
 func (w runtimePoolBootWitness) identity(kind string) store.ExternalEffectIdentity {
@@ -97,6 +98,10 @@ func nativeRuntimePoolProvider(provider string) bool {
 }
 
 func validateRuntimePoolBootWitness(w runtimePoolBootWitness, identity store.ExternalEffectIdentity, requestDigest string) error {
+	if w.Enforcement != nil && (w.Enforcement.Directory == "" || w.Enforcement.Validate() != nil) {
+		return fmt.Errorf("invalid retained node-local enforcement configuration")
+	}
+
 	digest, err := runtimePoolBootWitnessDigest(w)
 	if err != nil {
 		return err
@@ -196,7 +201,7 @@ func (r *RuntimePoolReconciler) observeNativeRuntimePoolBoot(ctx context.Context
 		pod.Status.PodIP != selected.Status.PodIP || !nativeRuntimePoolProvider(cfg.profile.ProviderKind) {
 		return nil, fmt.Errorf("%w: native runtime Pod enrollment identity changed", store.ErrConflict)
 	}
-	topologySpec, err := runtimePoolBootTopologySpec(pod.Spec)
+	topologySpec, err := runtimePoolEnforcedBootTopologySpec(pod.Spec, r.Enforcement.retained())
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +228,7 @@ func (r *RuntimePoolReconciler) observeNativeRuntimePoolBoot(ctx context.Context
 		return nil, err
 	}
 	return &runtimePoolBootWitness{
-		SchemaVersion: 1, PoolNamespace: pool.Namespace, PoolName: pool.Name, PoolUID: pool.UID, Provider: cfg.profile.ProviderKind,
+		SchemaVersion: 1, Enforcement: r.Enforcement.retained(), PoolNamespace: pool.Namespace, PoolName: pool.Name, PoolUID: pool.UID, Provider: cfg.profile.ProviderKind,
 		PodNamespace: pod.Namespace, PodName: pod.Name, PodUID: pod.UID, PodAddress: pod.Status.PodIP, PodSpecDigest: podDigest,
 		DeploymentName: deployment.Name, DeploymentUID: deployment.UID, ReplicaSetName: rs.Name, ReplicaSetUID: rs.UID,
 		TemplateDigest: runtimePoolPodTemplateRevision(deployment.Spec.Template), ContainerID: container.ContainerID,
@@ -301,7 +306,7 @@ func runtimePoolWitnessPod(w runtimePoolBootWitness, pod *corev1.Pod) (*corev1.C
 		pod.Labels[runtimePoolUIDLabel] != string(w.PoolUID) || pod.Labels[runtimePoolNameLabel] != w.PoolName || pod.Labels[runtimePoolNamespaceLabel] != w.PoolNamespace {
 		return nil, fmt.Errorf("%w: native runtime Pod enrollment ownership changed", store.ErrConflict)
 	}
-	topology, err := runtimePoolBootTopologySpec(pod.Spec)
+	topology, err := runtimePoolEnforcedBootTopologySpec(pod.Spec, w.Enforcement)
 	if err != nil {
 		return nil, err
 	}

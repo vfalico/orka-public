@@ -1018,3 +1018,86 @@ func TestRuntimePoolBootTopologyAdmitsOnlyRenderedToolboxInitContainers(t *testi
 		})
 	}
 }
+
+func TestRuntimePoolBootMarkedButNeverEnrolledDrainIsCleanupOnly(t *testing.T) {
+	for _, barrier := range []string{"none", "retention", "preparation"} {
+		t.Run(barrier, func(t *testing.T) {
+			f := newNativePoolBootFixture(t, false)
+			current := runtimePoolTestGetPool(t, f.r, f.pool)
+			cfg, err := f.r.runtimePoolConfig(&current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			active, err := validateRuntimePoolProbe(&current, cfg, &f.pod, f.supervisor.probe, runtimePoolTestNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current.Status.ActiveInstance = active
+			if err = f.r.Status().Update(t.Context(), &current); err != nil {
+				t.Fatal(err)
+			}
+			task := f.task(t, "never-admitted-drain")
+			if barrier == "retention" {
+				pod := &corev1.Pod{}
+				if err = f.r.Get(t.Context(), client.ObjectKeyFromObject(&f.pod), pod); err != nil {
+					t.Fatal(err)
+				}
+				controllerutil.AddFinalizer(pod, runtimePoolBootPodFinalizer)
+				if err = f.r.Update(t.Context(), pod); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if barrier == "preparation" {
+				w, err := f.r.observeNativeRuntimePoolBoot(t.Context(), &current, cfg, &f.pod)
+				if err != nil {
+					t.Fatal(err)
+				}
+				w.Fence = f.supervisor.probe.Status.Fence
+				digest, err := runtimePoolBootWitnessDigest(*w)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fence, err := f.r.runtimePoolRetirementFence(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = persistAgentRuntimeRecoveryEffect(t.Context(), f.control, fence, w.identity(runtimePoolBootPreparationKind), digest, w); err != nil {
+					t.Fatal(err)
+				}
+			}
+			status := runtimePoolValidProbe(f.pool, &f.pod, "native-boot", true).Status
+			incomplete := status
+			incomplete.Pressure.LiveDescendants = 1
+			if err = f.r.recordNativeRuntimePoolDrain(t.Context(), &current, active, incomplete); err == nil {
+				t.Fatal("incomplete drain accepted")
+			}
+			f.assertNoReceipt(t, task)
+			err = f.r.recordNativeRuntimePoolDrain(t.Context(), &current, active, status)
+			if barrier != "none" {
+				if err == nil {
+					t.Fatal("unresolved owner bypassed")
+				}
+				f.assertNoReceipt(t, task)
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = f.r.Get(t.Context(), client.ObjectKeyFromObject(task), task); err != nil {
+				t.Fatal(err)
+			}
+			if !runtimeSessionCleanupCompleteForUID(task, task.UID) {
+				t.Fatal("authenticated task cleanup lost")
+			}
+			if retired, err := verifiedNativeRuntimePoolRetirement(t.Context(), f.control, task, task.UID); err != nil || retired {
+				t.Fatalf("retroactive native retirement: %t %v", retired, err)
+			}
+			for _, kind := range []string{runtimePoolBootPreparationKind, runtimePoolBootWitnessKind} {
+				records, err := f.r.runtimePoolBootRecords(t.Context(), f.pool, kind)
+				if err != nil || len(records) != 0 {
+					t.Fatal("drain fabricated boot enrollment")
+				}
+			}
+		})
+	}
+}

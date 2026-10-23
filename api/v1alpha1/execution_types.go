@@ -9,7 +9,20 @@ package v1alpha1
 import corev1 "k8s.io/api/core/v1"
 
 // ExecutionSpec defines worker pod runtime and placement controls.
+// ExecutionRequirement carries opaque mandatory execution bytes, never pool configuration.
+type ExecutionRequirement struct {
+	Format               string   `json:"format"`
+	PolicyBytes          []byte   `json:"policyBytes"`
+	RequiredCapabilities []string `json:"requiredCapabilities"`
+	PayloadDigest        string   `json:"payloadDigest"`
+	Identity             string   `json:"identity"`
+}
+
 type ExecutionSpec struct {
+	// Requirement is immutable per execution and fails closed without a qualified backend.
+	// +optional
+	Requirement *ExecutionRequirement `json:"requirement,omitempty"`
+
 	// RuntimeClassName routes worker pods through a specific RuntimeClass.
 	// +optional
 	RuntimeClassName string `json:"runtimeClassName,omitempty"`

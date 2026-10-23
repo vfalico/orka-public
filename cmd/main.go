@@ -367,6 +367,7 @@ func main() {
 	var enableTracing bool
 	var workspaceProviderAPIEnabled bool
 	var tlsOpts []func(*tls.Config)
+	var acpEnforcerDirectory, acpEnforcerSeccomp, acpEnforcerNodes, acpEnforcerModelListener string
 
 	acpWorkspaceDispatchEnabled = strings.EqualFold(os.Getenv("ORKA_ACP_WORKSPACE_DISPATCH_ENABLED"), "true")
 	substrateMCPToolsEnabled := strings.EqualFold(os.Getenv("ORKA_SUBSTRATE_MCP_TOOLS_ENABLED"), "true")
@@ -506,6 +507,10 @@ func main() {
 		"Gateway dispatcher and delivery poll interval.")
 	flag.IntVar(&gatewayBatchSize, "gateway-batch-size", 25,
 		"Maximum gateway events, deliveries, Session cleanup candidates, or Task cleanup receipts processed per iteration (capped at 100).")
+	flag.StringVar(&acpEnforcerModelListener, "acp-enforcer-model-proxy-listen-address", "", "Optional exact literal loopback listener explicitly authored in complete policies; no automatic policy grant.")
+	flag.StringVar(&acpEnforcerDirectory, "acp-enforcer-directory", "", "Protected node-local generic enforcer config/socket/state directory; opt-in Pod lane only.")
+	flag.StringVar(&acpEnforcerSeccomp, "acp-enforcer-seccomp-profile", "", "Preinstalled Localhost seccomp profile permitting held clone3 and ordinary supervisor calls.")
+	flag.StringVar(&acpEnforcerNodes, "acp-enforcer-node-labels", "", "Exact key=value labels selecting preprovisioned enforcer-capable nodes.")
 	flag.StringVar(&storeBackend, "store-backend", "sqlite", "Storage backend (sqlite)")
 	flag.StringVar(&storePath, "store-path", "/data/orka.db", "Path to SQLite database file")
 	flag.StringVar(&agentExecutionSnapshotKeyFile, "agent-execution-snapshot-key-file", "",
@@ -1677,6 +1682,21 @@ func main() {
 			Scheme:               mgr.GetScheme(),
 			RuntimeNamespace:     acpRuntimeNamespace,
 			WorkspaceCleanupOnly: !workspaceProviderAPIEnabled,
+		}
+
+		var nodes map[string]string
+		var enforcerErr error
+		if acpEnforcerNodes != "" {
+			nodes, enforcerErr = parseExactLabels(acpEnforcerNodes)
+		}
+		if enforcerErr != nil {
+			setupLog.Error(enforcerErr, "invalid enforcer node selection")
+			os.Exit(1)
+		}
+		runtimePoolReconciler.Enforcement = controller.RuntimePoolEnforcement{Directory: acpEnforcerDirectory, SeccompProfile: acpEnforcerSeccomp, NodeSelector: nodes, ModelProxyListenAddress: acpEnforcerModelListener}
+		if enforcerErr = runtimePoolReconciler.Enforcement.Validate(); enforcerErr != nil {
+			setupLog.Error(enforcerErr, "invalid node-local enforcer configuration")
+			os.Exit(1)
 		}
 		providerProxyLabels, err := parseExactLabels(acpProviderProxyPodLabels)
 		if err != nil {

@@ -172,6 +172,22 @@ func (r *RuntimePoolReconciler) recordNativeRuntimePoolDrain(ctx context.Context
 		return err
 	}
 	w, err := loadRuntimePoolBootWitness(ctx, r.ControlStore, agentRuntimeRecoveryIdentity(runtimePoolBootWitnessKind, pool.UID, pool.Namespace, active.RuntimeInstanceID))
+	if errors.Is(err, store.ErrNotFound) {
+		// A template marker opts into enrollment; it is NOT evidence that
+		// enrollment happened. A controller restart can rotate credentials
+		// before the first admission. Such a boot may be drained, but must
+		// never acquire retroactive activation or physical-death authority.
+		// Any preparation (including an unresolved reservation), retention
+		// barrier, or uncertain store read keeps the original owner intact.
+		if controllerutil.ContainsFinalizer(pod, runtimePoolBootPodFinalizer) || pod.Annotations[runtimePoolBootRetentionAnnotation] != "" {
+			return fmt.Errorf("%w: uncommitted native boot retains cleanup ownership", store.ErrNotReady)
+		}
+		_, preparationErr := loadRuntimePoolBootWitness(ctx, r.ControlStore, agentRuntimeRecoveryIdentity(runtimePoolBootPreparationKind, pool.UID, pool.Namespace, active.RuntimeInstanceID))
+		if !errors.Is(preparationErr, store.ErrNotFound) {
+			return errors.Join(fmt.Errorf("%w: native boot preparation is unresolved", store.ErrNotReady), preparationErr)
+		}
+		return r.recordDrainedRuntimePoolTaskCleanup(ctx, pool, active, status)
+	}
 	if err != nil {
 		return err
 	}

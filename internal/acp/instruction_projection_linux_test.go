@@ -68,10 +68,7 @@ func TestProtectedInstructionProjection(t *testing.T) {
 				t.Fatal(err)
 			}
 			path := filepath.Join(paths.Home, relative)
-			binary, err := os.Executable()
-			if err != nil {
-				t.Fatal(err)
-			}
+			binary := copyTestExecutableForChild(t)
 			for cycle := range 2 {
 				if cycle > 0 {
 					if err := ReclaimSessionOwnership(paths.Root); err != nil {

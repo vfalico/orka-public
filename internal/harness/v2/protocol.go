@@ -270,20 +270,24 @@ type DrainStatus struct {
 }
 
 type RuntimeSessionStatus struct {
-	NativeInstallUnresolved bool                      `json:"nativeInstallUnresolved,omitempty"`
-	NativeRestoration       *NativeSessionRestoration `json:"nativeRestoration,omitempty"`
-	RuntimeSessionID        RuntimeSessionID          `json:"runtimeSessionID"`
-	RuntimeSessionUID       RuntimeSessionUID         `json:"runtimeSessionUID"`
-	Generation              uint64                    `json:"generation"`
-	State                   RuntimeSessionState       `json:"state"`
-	ActivePromptID          PromptID                  `json:"activePromptID,omitempty"`
-	PendingPermissionCount  uint32                    `json:"pendingPermissionCount"`
-	ReservedForFinalization bool                      `json:"reservedForFinalization"`
-	LiveDescendantCount     uint32                    `json:"liveDescendantCount"`
-	LastTransitionAt        time.Time                 `json:"lastTransitionAt"`
+	Enforcement             *RequirementEnforcementStatus `json:"enforcement,omitempty"`
+	NativeInstallUnresolved bool                          `json:"nativeInstallUnresolved,omitempty"`
+	NativeRestoration       *NativeSessionRestoration     `json:"nativeRestoration,omitempty"`
+	RuntimeSessionID        RuntimeSessionID              `json:"runtimeSessionID"`
+	RuntimeSessionUID       RuntimeSessionUID             `json:"runtimeSessionUID"`
+	Generation              uint64                        `json:"generation"`
+	State                   RuntimeSessionState           `json:"state"`
+	ActivePromptID          PromptID                      `json:"activePromptID,omitempty"`
+	PendingPermissionCount  uint32                        `json:"pendingPermissionCount"`
+	ReservedForFinalization bool                          `json:"reservedForFinalization"`
+	LiveDescendantCount     uint32                        `json:"liveDescendantCount"`
+	LastTransitionAt        time.Time                     `json:"lastTransitionAt"`
 }
 
 func (s RuntimeSessionStatus) Validate() error {
+	if err := s.Enforcement.Validate(); err != nil {
+		return err
+	}
 	if s.NativeInstallUnresolved && s.State != RuntimeSessionStatePoisoned {
 		return fmt.Errorf("unresolved native install must retain a poisoned runtime session")
 	}
